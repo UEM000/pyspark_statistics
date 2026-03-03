@@ -1,0 +1,112 @@
+from .enums import DataRealization
+
+from typing import List, Optional, Union
+
+from pyspark.sql import DataFrame, types
+import pyspark.sql.functions as F
+import numpy as np
+import pandas as pd
+
+class Spliter():
+    """
+    Однократное разбиение на группы
+    """
+
+    @staticmethod
+    def _select_data_realization(data):
+        if isinstance(data, DataFrame):
+            return DataRealization.spark
+        elif isinstance(data, pd.DataFrame):
+            return DataRealization.pandas
+        else:
+            raise Exception("Incorrect data format!")
+    
+    def __init__(self, 
+                 data: Union[DataFrame, pd.DataFrame], 
+                 random_state: int = 21,
+                 groups_num: int = 2, 
+                 fractions: List[float]=None):
+        
+        self.data = data
+        self.random_state = random_state
+        self.groups_num = groups_num
+        self.data_realization = self._select_data_realization(data)
+
+        if fractions is not None:
+            self.fractions = fractions
+        else:
+            self.fractions = [(1 / groups_num) for _ in range(groups_num)]
+
+        if self.data_realization == DataRealization.pandas:
+            self.size = len(self.data)
+
+    def _new_split_gen(self, number_of_generation=0, return_char=True):
+        _rand_col = F.rand(seed=self.random_state + number_of_generation)
+        new_split = F
+        for _i, _th in enumerate(np.cumsum(self.fractions)):
+            new_split = new_split.when(_rand_col <= _th, _i)
+        if return_char:
+            new_split = F.char(new_split.cast("int"))
+        return new_split
+
+class StandartSpliter(Spliter):
+
+    def __init__(self, 
+                 data, 
+                 random_state = 21, 
+                 groups_num = 2):
+        super().__init__(data, random_state, groups_num)
+
+
+    def split(self, number_of_generation: int=0) -> Union[DataFrame, pd.DataFrame]:
+        if self.data_realization == DataRealization.spark:
+            df_with_groups = self.data.withColumn("group", self._new_split_gen(number_of_generation=number_of_generation, return_char=False).cast("int"))
+        elif self.data_realization == DataRealization.pandas:
+            np.random.seed(self.random_state + number_of_generation)
+            df_with_groups = self.data.assign(group=np.random.choice(list(range(self.groups_num)), size=self.size, p=self.fractions))
+
+        return df_with_groups
+
+class BinarySpliter(Spliter):
+    """
+    Множественное разбиение на группы
+    """
+
+    def __init__(self, data, random_state = 21, groups_num = 2, fractions = None, k_splits: int=1):
+        super().__init__(data, random_state, groups_num, fractions)
+        self.k_splits = k_splits
+        
+
+        
+    
+    def _new_split_gen(self, number_of_generation=0, return_char=True):
+        _rand_col = F.rand(seed=self.random_state + number_of_generation)
+        new_split = F
+        for _i, _th in enumerate(np.cumsum(self.fractions)):
+            new_split = new_split.when(_rand_col <= _th, _i)
+        if return_char:
+            new_split = F.char(new_split.cast("int"))
+        return new_split
+    
+    def split(self) -> Union[DataFrame, pd.DataFrame]:
+
+        if self.data_realization == DataRealization.spark:
+            df_with_groups = (
+                                self.data
+                                .withColumn(
+                                    'group',
+                                    F.concat(*[
+                                        self._new_split_gen(number_of_generation=_number_of_generation)
+                                        for _number_of_generation in range(self.k_splits)
+                                    ]).cast("binary")
+                                )
+                            )
+        elif self.data_realization == DataRealization.pandas:
+            np.random.seed(self.random_state)
+            df_with_groups = self.data.assign(group=np.random.choice(
+                                                                        list(range(self.groups_num)), 
+                                                                        size=(self.size, self.k_splits), 
+                                                                        p=self.fractions
+                                                                    ).tolist())
+
+        return df_with_groups
