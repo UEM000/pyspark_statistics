@@ -22,6 +22,7 @@ from scipy.stats import (
 )
 
 import numpy as np
+import pandas as pd
 
 Alternative = Literal["two-sided", "less", "greater"]
 Method = Literal["auto", "exact", "asymp"]
@@ -337,7 +338,7 @@ class TestingChiSquare(StatTest):
         #     return self._alternative_calculation()
 
         if self.realization:
-            return self._spark_calc(self.realization - 1, correction)
+            return self._transform_stats_to_dict(self._spark_calc(self.realization - 1, correction))
         
 
         group_lsit = list(range(self.groups_num))
@@ -359,8 +360,19 @@ class TestingChiSquare(StatTest):
         
         return result
                 
-        
-
+    def _transform_stats_to_dict(self, df: pd.DataFrame) -> Dict[str, Union[float, bool]]:
+        result = {}
+        for column_name, group_df in df.groupby('column'):
+            result[column_name] = {}
+            for idx, row in group_df.iterrows():
+                key = f"split: {int(row['split'])} group: 0, {int(row['group'])}"
+                p_val = float(row['p_value'])
+                result[column_name][key] = {
+                    'p-value': p_val,
+                    'statistic' : float(row['statistic']),
+                    'pass' : bool(p_val < self.reliability)
+                }    
+        return result
 
     def _spark_calc(self, binary: bool, correction: bool):
         group_column = self.label_column

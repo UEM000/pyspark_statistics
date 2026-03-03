@@ -1,6 +1,7 @@
 from .config import test_list, experiment_data
 from ..statistic_realization.spark_statistic import TestingTTest, TestingChiSquare, TestingKStest
 from ..statistic_realization.pandas_statistic import TestingTTestPandas, TestingKStestPandas, TestingChiSquarePandas
+from ..statistic_realization.polars_statistic import Ttest, ChiSquare, KStest
 from ..utils.spliter import StandartSpliter, BinarySpliter
 from ..utils.reporter import Reporter, MemorySparkReporter
 from ..utils.enums import DataRealization
@@ -13,6 +14,7 @@ from typing import Callable, Dict, Any, Union
 
 import numpy as np
 import pandas as pd
+import polars as pl
 import sys
 
 class Experiment():
@@ -95,12 +97,24 @@ class Experiment():
                         cur_data = self.data.sample(frac=cur_params['fractions'],
                                                     random_state=self.constants["random_state"],
                                                     replace=False)
+                    elif self.data_realization == DataRealization.polars:
+                        if isinstance(self.data, pl.LazyFrame):
+                            np.random.seed(self.constants["random_state"])
+                            n_rows = self.data.select(pl.len()).collect().item()
+                            indices = sorted(np.random.choice(n_rows, size=int(cur_params['fractions'] * n_rows), replace=False))
+                            cur_data = self.data.select(pl.col("*").gather(indices))
+                        else:
+                            cur_data = self.data.sample(fraction=cur_params['fractions'],
+                                                        seed=self.constants["random_state"],
+                                                        with_replacement=True).lazy()
                 else:
                     cur_data = self.data
+
                 if categorical:
                     target_columns = self.constants["target_category_columns"]
                 else:
                     target_columns = self.constants["target_numeric_columns"]
+
                 cur_target_cols = np.random.choice(target_columns, 
                                                     int(cur_params['target_frac'] * len(target_columns)), 
                                                     replace=False).tolist()
@@ -170,7 +184,14 @@ class Experiment():
                 "chisquare" : TestingChiSquarePandas,
                 "kstest" : TestingKStestPandas
             }
-            
+        elif self.data_realization == DataRealization.polars:
+            test_dict = {
+                "ttest" : Ttest,
+                "chisquare" : ChiSquare,
+                "kstest" : KStest
+            }
+        else:
+            raise TypeError("Incorrect type!")
         return test_dict[test_name]
         
 
@@ -189,7 +210,6 @@ class Experiment():
             for param, value in cur_params.items():
                 f.write(f"{param}={value}; ")
             report = reporter.get_report()
-            # f.write(f"\n{report}\n")
             for element, result in report.items():
                 f.write(f"{element} = {result:.5f}; ")
             f.write("\n")
@@ -206,14 +226,14 @@ class Experiment():
                             f.write(f"{name}={value}; ")
                         f.write("\n")
                         
-        
-
     @staticmethod
     def _select_data_realization(data):
         if isinstance(data, DataFrame):
             return DataRealization.spark
         elif isinstance(data, pd.DataFrame):
             return DataRealization.pandas
+        elif isinstance(data, pl.DataFrame) or isinstance(data, pl.LazyFrame):
+            return DataRealization.polars
         else:
             raise Exception("Incorrect data format!")
     

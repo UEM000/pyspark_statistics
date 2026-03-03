@@ -8,6 +8,11 @@ from .pandas_statistic import (
     TestingChiSquarePandas,
     TestingKStestPandas
 )
+from .polars_statistic import (
+    Ttest,
+    ChiSquare,
+    KStest
+)
 
 __all__ = [
     "TestingTTest",
@@ -15,5 +20,8 @@ __all__ = [
     "TestingKStest",
     "TestingTTestPandas",
     "TestingChiSquarePandas",
-    "TestingKStestPandas"
+    "TestingKStestPandas",
+    "Ttest",
+    "ChiSquare",
+    "KStest"
 ]

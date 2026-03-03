@@ -6,6 +6,7 @@ from pyspark.sql import DataFrame, types
 import pyspark.sql.functions as F
 import numpy as np
 import pandas as pd
+import polars as pl
 
 class Spliter():
     """
@@ -18,6 +19,8 @@ class Spliter():
             return DataRealization.spark
         elif isinstance(data, pd.DataFrame):
             return DataRealization.pandas
+        elif isinstance(data, pl.DataFrame) or isinstance(data, pl.LazyFrame):
+            return DataRealization.polars
         else:
             raise Exception("Incorrect data format!")
     
@@ -39,6 +42,18 @@ class Spliter():
 
         if self.data_realization == DataRealization.pandas:
             self.size = len(self.data)
+        elif self.data_realization == DataRealization.polars:
+            if isinstance(self.data, pl.DataFrame):
+                self.size = self.df.shape[0]
+                self._is_lazy = False
+            else:
+                self.size = (
+                                self.data
+                                .select(pl.len())
+                                .collect()
+                                .item()
+                            )
+                self._is_lazy = True 
 
     def _new_split_gen(self, number_of_generation=0, return_char=True):
         _rand_col = F.rand(seed=self.random_state + number_of_generation)
@@ -60,10 +75,22 @@ class StandartSpliter(Spliter):
 
     def split(self, number_of_generation: int=0) -> Union[DataFrame, pd.DataFrame]:
         if self.data_realization == DataRealization.spark:
-            df_with_groups = self.data.withColumn("group", self._new_split_gen(number_of_generation=number_of_generation, return_char=False).cast("int"))
+            df_with_groups = (
+                self.data
+                .withColumn("group", self._new_split_gen(number_of_generation=number_of_generation, return_char=False).cast("int"))
+            )
         elif self.data_realization == DataRealization.pandas:
             np.random.seed(self.random_state + number_of_generation)
-            df_with_groups = self.data.assign(group=np.random.choice(list(range(self.groups_num)), size=self.size, p=self.fractions))
+            df_with_groups = (
+                self.data
+                .assign(group=np.random.choice(list(range(self.groups_num)), size=self.size, p=self.fractions))
+            )
+        elif self.data_realization == DataRealization.polars:
+            np.random.seed(self.random_state + number_of_generation)
+            df_with_groups = (
+                self.data
+                .with_columns(group=pl.lit(np.random.choice(list(range(self.groups_num)), size=self.size, p=self.fractions)).cast(pl.Int16))
+            )
 
         return df_with_groups
 
@@ -108,5 +135,7 @@ class BinarySpliter(Spliter):
                                                                         size=(self.size, self.k_splits), 
                                                                         p=self.fractions
                                                                     ).tolist())
+        else:
+            raise TypeError("No polars realization!")
 
         return df_with_groups
