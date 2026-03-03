@@ -4,3 +4,4 @@ import enum
 class DataRealization(enum.Enum):
     spark = 0
     pandas = 1
+    polars = 2
