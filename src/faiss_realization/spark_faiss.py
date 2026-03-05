@@ -52,17 +52,17 @@ class FaissSpark:
         Подготовка входных данных: векторизация и проверка на категориальные фичи.
         Все незакодированные фичи будут вызывать ошибку работы / (в дальнейшем просто выкидываться?).
 
-        Параметры
+        Parameters
         ----------
-            data : *SparkDataFrame*
+            data : SparkDataFrame
                 Входные данные. Должен содержать:
                     - Числовые фичи;
                     - Заэнкоженные категориальные фичи;
         
-        Возвращает
-        ----------
-            *SparkDataFrame* 
-            входной датасет с колонкой векторов из фичей.
+        Returns
+        -------
+            vectorized_data: SparkDataFrame
+                входной датасет с колонкой векторов из фичей.
         """
         if self.feature_cols is None:
             self.feature_cols = data.columns
@@ -84,8 +84,8 @@ class FaissSpark:
         Прямое вычисление faiss с выгрузкой данных на драйвер.
         """
         prepeared_data = self._vectorize_data(data)
-        select_cols = ["cluster_id", "features"]
-        rows = data.select(*select_cols).collect()
+        select_cols = ["features"]
+        rows = prepeared_data.select(*select_cols).collect()
         X = np.array([list(row.features) for row in rows], dtype=np.float32)
         self._index = faiss.IndexFlatL2(X.shape[1])
         self._index.add(X)
@@ -169,15 +169,15 @@ class FaissSpark:
         """
         Разбиение на кластеры для дальнейшего использования faiss для каждого кластера.
 
-        Параметры
+        Parametrs
         ----------
-            data : *SparkDataFrame*
+            data : SparkDataFrame
                 Подготовленные данные с помощью *_vectorize_data*
         
-        Возвращает
-        ----------
-            *SparkDataFrame* 
-            Датафрейм с колонкой пренадлежности к кластеру.
+        Returns
+        -------
+            df_clustered : SparkDataFrame
+                Датафрейм с колонкой пренадлежности к кластеру.
         """
         # vectorized_data = self._vectorize_data(data)
         self._kmeans_model = KMeans(k=self.k, 
@@ -221,9 +221,9 @@ class FaissSpark:
         """
         Predict.
         
-        Возвращает
-        ----------
-        List[Tuple[int, int, float]]
+        Returns
+        -------
+        result : List[Tuple[int, int, float]]
             Список кортежей: (порядковый номер записи в test_data, найденный близнец, расстояние до него)
         """
         prepeared_data = self._vectorize_data(test_data)
