@@ -1,5 +1,6 @@
 import numpy as np
 import pyspark.sql as spark
+import pyspark.sql.functions as F
 import faiss
 
 from pyspark.ml.feature import VectorAssembler
@@ -9,7 +10,8 @@ from pyspark import StorageLevel
 from typing import (
     Union,
     List,
-    Literal
+    Literal,
+    Optional
 )
 class FaissSpark:
     """
@@ -25,27 +27,25 @@ class FaissSpark:
     PERSIST_POLITIC = StorageLevel.DISK_ONLY
 
     def __init__(self,
-                #  data: spark.DataFrame,
                  n_neighbors: int = 1,
                  k: int = 1000,
-                 seed: Union[int, None] = None, 
+                 seed: Union[int, None] = None,
                  feature_cols: Union[List[str], None] = None,
                  faiss_mode: Literal["base", "fast", "auto"] = "auto",
-                 mode: Literal["auto", "fit", "predict"] = "auto"
                  ):
-        # self.data = data
         self.n_neighbors = n_neighbors
-        self.k = k
+        self.k = k  # Количество кластеров
+        # self.n_clusters = k  # ✅ Инициализируем n_clusters
         self.seed = seed
         self.feature_cols = feature_cols
         self.faiss_mode = faiss_mode
-        
+
         self._kmeans_model = None
         self._index = None
         self._centroid_index = None
-        self._centroid_list: List[np.ndarray] = None
-        self._clustered_data: spark.DataFrame = None
-        self._mode = None
+        self._centroid_list: List[np.ndarray] | None = None
+        self._clustered_data: spark.DataFrame | None = None
+        self._mode: Optional[Literal["base", "fast"]] = None
 
     def _vectorize_data(self, data: spark.DataFrame) -> spark.DataFrame:
         """
@@ -83,7 +83,9 @@ class FaissSpark:
         """
         Прямое вычисление faiss с выгрузкой данных на драйвер.
         """
-        rows = data.collect()
+        prepeared_data = self._vectorize_data(data)
+        select_cols = ["cluster_id", "features"]
+        rows = data.select(*select_cols).collect()
         X = np.array([list(row.features) for row in rows], dtype=np.float32)
         self._index = faiss.IndexFlatL2(X.shape[1])
         self._index.add(X)
@@ -94,18 +96,74 @@ class FaissSpark:
         """
         prepeared_data = self._vectorize_data(data)
         df_clustered = self._clustering(prepeared_data)
-        self._clustered_data = df_clustered.persist(self.PERSIST_POLITIC)
+        select_cols = ["cluster_id", "features"]
+        self._clustered_data = (
+            df_clustered
+            .select(*select_cols)
+            .persist(self.PERSIST_POLITIC)
+        )
+        self._clustered_data.count()
+        
         X = np.array(self._centroid_list, dtype=np.float32)
-        self._idnex= faiss.IndexFlatL2(X.shape[1])
-        self._index.add(X)
+        self._centroid_index= faiss.IndexFlatL2(X.shape[1])
+        self._centroid_index.add(X)
 
-    def _direct_predict(self, test_data: spark.DataFrame):
-        rows = test_data.collect()
-        X = np.array([list(row) for row in rows], dtype=np.float32)
+    def _direct_predict(self, test_data: spark.DataFrame) -> List[List[Union[int, float]]]:
+        rows = test_data.select("features").collect()
+        X = np.array([list(row.features) for row in rows], dtype=np.float32)
         dist, indexes = self._index.search(X, k=self.n_neighbors)
+        
+        # Возвращаем список кортежей: [(query_idx, neighbor_idx, distance), ...]
+        result = []
+        for query_idx in range(len(X)):
+            for i in range(self.n_neighbors):
+                neighbor_idx = int(indexes[query_idx][i])
+                distance = float(dist[query_idx][i])
+                result.append((query_idx, neighbor_idx, distance))
+        
+        return result
     
-    def _clustering_predict(self, test_data: spark.DataFrame):
-        ...
+    def _clustering_predict(self, test_data: spark.DataFrame) -> List[List[Union[int, float]]]:
+        result = []
+        rows = test_data.select("features").collect()
+        X = np.array([list(row.features) for row in rows], dtype=np.float32)
+        _, cluster_ids = self._centroid_index.search(X, k=1)
+        # В spark KMeans центроиды возвращаются в соответствии с порядковым номером их кластера
+        # Поэтому индекс сразу указывает нам на то, какой кластер нам нужен
+        for query_idx in range(len(X)):
+            query_vector = X[query_idx:query_idx+1]
+            cluster_id = int(cluster_ids[query_idx][0])
+            
+            cluster_rows = (
+                self._clustered_data
+                .filter(F.col('cluster_id') == cluster_id)
+                .select("features")
+                .collect()
+            )
+            
+            # Проверка на пустой кластер
+            if len(cluster_rows) == 0:
+                result.append((query_idx, -1, float('inf')))
+                continue
+            
+            cluster_data = np.array(
+                [list(row.features) for row in cluster_rows], 
+                dtype=np.float32
+            )
+            
+            tmp_index = faiss.IndexFlatL2(cluster_data.shape[1])
+            tmp_index.add(cluster_data)
+            
+            r_dist, r_indexes = tmp_index.search(query_vector, k=self.n_neighbors)
+            
+            # Возвращаем результат: (query_idx, neighbor_idx, distance)
+            for i in range(self.n_neighbors):
+                neighbor_idx = int(r_indexes[0][i])
+                distance = float(r_dist[0][i])
+                result.append((query_idx, neighbor_idx, distance))
+        
+        return result
+        
 
     def _clustering(self, data: spark.DataFrame) -> spark.DataFrame:
         """
@@ -147,6 +205,7 @@ class FaissSpark:
     
     def fit(self, data: spark.DataFrame) -> "FaissSpark":
         """
+        Fit.
         """
         count = data.count()
         self._mode = self._calculation_mode(count)
@@ -158,13 +217,33 @@ class FaissSpark:
 
         return self
     
-    def predict(self, test_data: spark.DataFrame) -> spark.DataFrame:
+    def predict(self, test_data: spark.DataFrame):
         """
-        """
-        if self._mode == "base":
-            result = self._direct_predict(test_data)
-        if self._data == "fast":
-            result = self._clustering_predict(test_data)
-
+        Predict.
         
+        Возвращает
+        ----------
+        List[Tuple[int, int, float]]
+            Список кортежей: (порядковый номер записи в test_data, найденный близнец, расстояние до него)
+        """
+        prepeared_data = self._vectorize_data(test_data)
+        if self._mode == "base":
+            result = self._direct_predict(prepeared_data)
+        elif self._mode == "fast":
+            result = self._clustering_predict(prepeared_data)
+        else:
+            raise RuntimeError("Модель не обучена. Вызовите fit() перед predict().")
+        
+        return result
+
+    def unpersist(self):
+        """
+        Подчистить ресурсы spark.
+        """
+        if self._clustered_data is not None:
+            self._clustered_data.unpersist()
+            self._clustered_data = None
+        
+    def __del__(self):
+        self.unpersist()
             
