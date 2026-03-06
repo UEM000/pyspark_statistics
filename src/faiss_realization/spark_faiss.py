@@ -7,6 +7,7 @@ from pyspark.ml.feature import VectorAssembler
 from pyspark.ml.clustering import KMeans
 from pyspark import StorageLevel
 
+from collections import defaultdict
 from typing import (
     Union,
     List,
@@ -24,7 +25,7 @@ class FaissSpark:
             1. Преобрауем датасет в pandas;
             2. Используем faiss на нашем датасете.
     """
-    PERSIST_POLITIC = StorageLevel.DISK_ONLY
+    PERSIST_POLITIC = StorageLevel.MEMORY_AND_DISK
 
     def __init__(self,
                  n_neighbors: int = 1,
@@ -34,8 +35,7 @@ class FaissSpark:
                  faiss_mode: Literal["base", "fast", "auto"] = "auto",
                  ):
         self.n_neighbors = n_neighbors
-        self.k = k  # Количество кластеров
-        # self.n_clusters = k  # ✅ Инициализируем n_clusters
+        self.k = k 
         self.seed = seed
         self.feature_cols = feature_cols
         self.faiss_mode = faiss_mode
@@ -130,37 +130,31 @@ class FaissSpark:
         _, cluster_ids = self._centroid_index.search(X, k=1)
         # В spark KMeans центроиды возвращаются в соответствии с порядковым номером их кластера
         # Поэтому индекс сразу указывает нам на то, какой кластер нам нужен
-        for query_idx in range(len(X)):
-            query_vector = X[query_idx:query_idx+1]
-            cluster_id = int(cluster_ids[query_idx][0])
-            
+        cluster_to_queries = defaultdict(list)
+        for query_idx, cluster_idx in enumerate(cluster_ids.flatten()):
+            cluster_to_queries[cluster_idx].append(query_idx)
+
+        for cluster_idx, query_idx_list in cluster_to_queries.items():
             cluster_rows = (
                 self._clustered_data
-                .filter(F.col('cluster_id') == cluster_id)
+                .filter(F.col('cluster_id') == cluster_idx)
                 .select("features")
                 .collect()
             )
-            
-            # Проверка на пустой кластер
-            if len(cluster_rows) == 0:
-                result.append((query_idx, -1, float('inf')))
-                continue
-            
             cluster_data = np.array(
                 [list(row.features) for row in cluster_rows], 
                 dtype=np.float32
             )
-            
             tmp_index = faiss.IndexFlatL2(cluster_data.shape[1])
             tmp_index.add(cluster_data)
-            
-            r_dist, r_indexes = tmp_index.search(query_vector, k=self.n_neighbors)
-            
-            # Возвращаем результат: (query_idx, neighbor_idx, distance)
-            for i in range(self.n_neighbors):
-                neighbor_idx = int(r_indexes[0][i])
-                distance = float(r_dist[0][i])
-                result.append((query_idx, neighbor_idx, distance))
+            k = min(self.n_neighbors, len(cluster_data))
+            for query_idx in query_idx_list:
+                r_dist, r_indexes = tmp_index.search(X[query_idx: query_idx+1], k=k)
+                # Возвращаем результат: (query_idx, neighbor_idx, distance)
+                for i in range(self.n_neighbors):
+                    neighbor_idx = int(r_indexes[0][i])
+                    distance = float(r_dist[0][i])
+                    result.append((query_idx, neighbor_idx, distance))
         
         return result
         
