@@ -141,8 +141,15 @@ class FaissSpark:
                 .select("features")
                 .collect()
             )
+            
+            # Проверка на пустой кластер
+            if len(cluster_rows) == 0:
+                for query_idx in query_idx_list:
+                    result.append((query_idx, -1, float('inf')))
+                continue
+            
             cluster_data = np.array(
-                [list(row.features) for row in cluster_rows], 
+                [list(row.features) for row in cluster_rows],
                 dtype=np.float32
             )
             tmp_index = faiss.IndexFlatL2(cluster_data.shape[1])
@@ -151,7 +158,7 @@ class FaissSpark:
             for query_idx in query_idx_list:
                 r_dist, r_indexes = tmp_index.search(X[query_idx: query_idx+1], k=k)
                 # Возвращаем результат: (query_idx, neighbor_idx, distance)
-                for i in range(self.n_neighbors):
+                for i in range(k):  # ✅ Используем k, а не self.n_neighbors
                     neighbor_idx = int(r_indexes[0][i])
                     distance = float(r_dist[0][i])
                     result.append((query_idx, neighbor_idx, distance))
