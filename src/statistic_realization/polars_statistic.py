@@ -101,17 +101,10 @@ class Ttest(StaticTest):
             pass
         else:
             raise Exception(f"Incorrect target col format! {type(self.target_columns).__name__}")
-        
+
         group_pairs = [(self.control_label, group) for group in range(self.groups_num) if group != self.control_label]
         grouped_df = self.data.group_by(self.label_column)
 
-        pivot_df = (
-                    pl.concat([self._aggregator_func(grouped_df, column) for column in self.target_columns])
-                    # .with_columns(split=pl.lit(self.k_splits))
-                )
-        if isinstance(self.data, pl.LazyFrame):
-            pivot_df = pivot_df.cache()
-        # for split_idx in range(self.k_splits):
         result = {}
         for column in self.target_columns:
             tmp_dict = {}
@@ -125,9 +118,10 @@ class Ttest(StaticTest):
                                                                                                  test_function=ttest_ind,
                                                                                                  nan_policy='omit')
                     elif self.realization == 1:
+                        pivot_df = self._aggregator_func(grouped_df, column)
                         _, count, mean, std, _= (
                             pivot_df
-                            .filter((pl.col("column") == column) & ((pl.col("group") == test) | (pl.col("group") == control)))
+                            .filter((pl.col("group") == test) | (pl.col("group") == control))
                             .collect()
                         )
                         count, mean, std = count.to_numpy(), mean.to_numpy(), std.to_numpy()
