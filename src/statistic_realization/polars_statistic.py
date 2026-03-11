@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import polars as pl
 import numpy as np
 from abc import ABC
@@ -32,14 +34,15 @@ NanPolicy = Literal["propagate", "omit", "raise"]
 class StaticTest(ABC):
     def __init__(self,
                  data: Union[pl.DataFrame, pl.LazyFrame],
-                 target_columns: Union[str, List[str]], 
-                 label_column: str, 
-                 groups_num: int, 
-                 k_splits: int, 
-                 reliability=0.05, 
+                 target_columns: Union[str, List[str]],
+                 label_column: str,
+                 groups_num: int,
+                 k_splits: int,
+                 reliability=0.05,
                  control_label: int = 0,
                  realization: int = 1):
-        self.data = data.drop_nulls() # все null выбрасываются
+        self._original_data = data
+        self.data = data.lazy().drop_nulls()  # Ленивое удаление null
         self.target_columns = target_columns
         self.label_column = label_column
         self.reliability = reliability
@@ -47,33 +50,40 @@ class StaticTest(ABC):
         self.k_splits = k_splits
         self.control_label = control_label
         self.realization = realization
+        self._data_cache = None  # Кэш для материализованных данных
+
+    def _materialize_data(self):
+        """Материализуем данные один раз вместо многократных collect()"""
+        if self._data_cache is None:
+            # Используем streaming для больших данных и оптимизированный collect
+            self._data_cache = self.data.collect(streaming=True)
+        return self._data_cache
 
     def _scipy_calc(self,
-                    control_label: int, 
-                    test_label: int, 
-                    target_column: str, 
+                    control_label: int,
+                    test_label: int,
+                    target_column: str,
                     label_column: str,
                     test_function: Callable,
                     **kwargs):
+        # Используем уже материализованные данные
+        df = self._materialize_data()
+        
         control_column = (
-                            self.data
-                            .filter(pl.col(label_column) == control_label)
-                            .select(target_column)
-                            .fill_null(np.nan)
-                            .collect()
-                            .to_numpy()
-                            .flatten()
-                        )
-        test_column =  (
-                            self.data
-                            .filter(pl.col(label_column) == test_label)
-                            .select(target_column)
-                            .fill_null(np.nan)
-                            .collect()
-                            .to_numpy()
-                            .flatten()
-                        )
-    
+            df
+            .filter(pl.col(label_column) == control_label)
+            .select(target_column)
+            .to_numpy()
+            .flatten()
+        )
+        test_column = (
+            df
+            .filter(pl.col(label_column) == test_label)
+            .select(target_column)
+            .to_numpy()
+            .flatten()
+        )
+
         result = test_function(control_column, test_column, **kwargs,)
         return {
                     "p-value": result[1],
@@ -83,17 +93,17 @@ class StaticTest(ABC):
 
 class Ttest(StaticTest):
 
-    def __init__(self, 
-                 data, 
-                 target_columns, 
-                 label_column, 
-                 groups_num, 
-                 k_splits, 
-                 reliability=0.05, 
-                 control_label = 0, 
+    def __init__(self,
+                 data,
+                 target_columns,
+                 label_column,
+                 groups_num,
+                 k_splits,
+                 reliability=0.05,
+                 control_label = 0,
                  realization = 1):
         super().__init__(data, target_columns, label_column, groups_num, k_splits, reliability, control_label, realization)
-    
+
     def calculate(self) -> Dict[str, float]:
         if isinstance(self.target_columns, str):
             self.target_columns = [self.target_columns]
@@ -103,7 +113,31 @@ class Ttest(StaticTest):
             raise Exception(f"Incorrect target col format! {type(self.target_columns).__name__}")
 
         group_pairs = [(self.control_label, group) for group in range(self.groups_num) if group != self.control_label]
-        grouped_df = self.data.group_by(self.label_column)
+        
+        # Оптимизация: агрегируем все столбцы за один проход
+        df = self._materialize_data()
+        
+        # Создаем выражения для агрегации всех целевых столбцов
+        agg_exprs = [self.label_column]
+        for column in self.target_columns:
+            agg_exprs.extend([
+                pl.col(column).count().alias(f"{column}_count"),
+                pl.col(column).mean().alias(f"{column}_mean"),
+                pl.col(column).var().alias(f"{column}_std")
+            ])
+        
+        # Агрегируем все столбцы за один проход и конвертируем в dict для быстрого доступа
+        pivot_df = (
+            df
+            .group_by(self.label_column)
+            .agg(agg_exprs[1:])  # Исключаем label_column из agg
+        )
+        
+        # Конвертируем в словарь для O(1) доступа вместо фильтрации в цикле
+        pivot_dict = {
+            row[self.label_column]: row 
+            for row in pivot_df.to_dicts()
+        }
 
         result = {}
         for column in self.target_columns:
@@ -118,13 +152,17 @@ class Ttest(StaticTest):
                                                                                                  test_function=ttest_ind,
                                                                                                  nan_policy='omit')
                     elif self.realization == 1:
-                        pivot_df = self._aggregator_func(grouped_df, column)
-                        _, count, mean, std, _= (
-                            pivot_df
-                            .filter((pl.col("group") == test) | (pl.col("group") == control))
-                            .collect()
-                        )
-                        count, mean, std = count.to_numpy(), mean.to_numpy(), std.to_numpy()
+                        # Быстрый доступ из словаря вместо фильтрации
+                        row_test = pivot_dict.get(test)
+                        row_control = pivot_dict.get(control)
+                        
+                        if row_test is None or row_control is None:
+                            continue
+                            
+                        count = np.array([row_control[f"{column}_count"], row_test[f"{column}_count"]])
+                        mean = np.array([row_control[f"{column}_mean"], row_test[f"{column}_mean"]])
+                        std = np.array([row_control[f"{column}_std"], row_test[f"{column}_std"]])
+                        
                         tmp_dict[f"split: {split} groups: {control}, {test}"] = self._single_calc(std,
                                                                                                   mean,
                                                                                                  count)
@@ -133,21 +171,7 @@ class Ttest(StaticTest):
             result[column] = tmp_dict
         return result
     
-    @staticmethod
-    def _aggregator_func(g_df, column: str) -> pl.LazyFrame:
-        return (
-            g_df
-            .agg([
-                pl.col(column).count().alias("count"),
-                pl.col(column).mean().alias("mean"),
-                pl.col(column).var().alias("std")
-            ])
-            .with_columns(
-                            column=pl.lit(column)
-                        )
-        )
-    
-    def _single_calc(self, current_variance: tuple, current_mean: tuple, currecnt_size: tuple) -> Dict[str, Union[float, str]]:
+    def _single_calc(self, current_variance: Tuple[float, ...], current_mean: Tuple[float, ...], currecnt_size: Tuple[int, ...]) -> Dict[str, Union[float, str]]:
         similar_var = (current_variance[0] / current_variance[1] < 2 and current_variance[0] / current_variance[1] > 0.5)
 
         t_stat = self._t_statistics(n_list=currecnt_size,
@@ -166,11 +190,11 @@ class Ttest(StaticTest):
                     "statistic": abs(t_stat),
                     "pass": p_value < self.reliability,
                 }
-    
+
     @staticmethod
-    def _t_statistics(n_list: tuple, 
-                      s_list: tuple, 
-                      mean_list: tuple, 
+    def _t_statistics(n_list: Tuple[float, ...],
+                      s_list: Tuple[float, ...],
+                      mean_list: Tuple[float, ...],
                       similar_var: bool = True) -> float:
         if similar_var:
             sp = sqrt(
@@ -187,8 +211,8 @@ class Ttest(StaticTest):
         return t_stat
     
     @staticmethod
-    def _degree_fredom(n_list: tuple, 
-                       s_list: tuple = (0, 0), 
+    def _degree_fredom(n_list: Tuple[float, ...],
+                       s_list: Tuple[float, ...] = (0, 0),
                        similar_var: bool = True) -> Union[int, float]:
         if similar_var:
             return n_list[0] + n_list[1] - 2
@@ -202,14 +226,14 @@ class Ttest(StaticTest):
 
 class ChiSquare(StaticTest):
 
-    def __init__(self, 
-                 data, 
-                 target_columns, 
-                 label_column, 
-                 groups_num, 
-                 k_splits, 
-                 reliability=0.05, 
-                 control_label = 0, 
+    def __init__(self,
+                 data,
+                 target_columns,
+                 label_column,
+                 groups_num,
+                 k_splits,
+                 reliability=0.05,
+                 control_label = 0,
                  realization = 1):
         super().__init__(data, target_columns, label_column, groups_num, k_splits, reliability, control_label, realization)
 
@@ -220,17 +244,34 @@ class ChiSquare(StaticTest):
             pass
         else:
             raise Exception(f"Incorrect target col format! {type(self.target_columns).__name__}")
-        
-        group_pairs = [(self.control_label, group) for group in range(self.groups_num) if group != self.control_label]
-        grouped_df = self.data.group_by(self.label_column)
 
-        pivot_df = (
-                    pl.concat([self._aggregator_func(grouped_df, column) for column in self.target_columns])
-                    # .with_columns(split=pl.lit(self.k_splits))
-                )
-        if isinstance(self.data, pl.LazyFrame):
-            pivot_df = pivot_df.cache()
-        # for split_idx in range(self.k_splits):
+        group_pairs = [(self.control_label, group) for group in range(self.groups_num) if group != self.control_label]
+        
+        # Оптимизация: агрегируем все столбцы за один проход без explode
+        df = self._materialize_data()
+        
+        # Агрегируем все целевые столбцы за один проход с кэшированием
+        pivot_dfs = []
+        for column in self.target_columns:
+            pivot_df = self._aggregator_func_optimized(df, column, self.label_column)
+            pivot_dfs.append(pivot_df)
+        
+        # Объединяем результаты
+        if pivot_dfs:
+            full_pivot_df = pl.concat(pivot_dfs, how="vertical_relaxed")
+        else:
+            full_pivot_df = pl.DataFrame()
+        
+        # Оптимизация: конвертируем в словарь для быстрого доступа
+        # Группируем данные по column и group для O(1) доступа
+        pivot_cache = {}
+        for row in full_pivot_df.to_dicts():
+            key = (row["column"], row["group"])
+            pivot_cache[key] = {
+                "category": row["category"],
+                "freq": row["freq"]
+            }
+        
         result = {}
         for column in self.target_columns:
             tmp_dict = {}
@@ -240,36 +281,42 @@ class ChiSquare(StaticTest):
                         if self.realization == 0:
                             Warning("No nessesity to make the scipy realization")
 
-                        test_list = (
-                            pivot_df
-                            .filter((pl.col("column") == column) & (pl.col("group") == test))
-                            .select("freq", "category")
-                            .collect()
-                            .to_dicts()
-                        )
-
-                        control_list = (
-                            pivot_df
-                            .filter((pl.col("column") == column) & (pl.col("group") == control))
-                            .select("freq", "category")
-                            .collect()
-                            .to_dicts()
-                        )
-
-                        # test_dict = {k : v for d in test_list for k, v in d.items()}
-                        # control_dict = {k : v for d in control_list for k, v in d.items()}
-                        test_dict = {d["category"]: d["freq"] for d in test_list}
-                        control_dict = {d["category"]: d["freq"] for d in control_list}
+                        # Быстрый доступ из кэша вместо фильтрации
+                        test_data = [v for k, v in pivot_cache.items() if k[0] == column and k[1] == test]
+                        control_data = [v for k, v in pivot_cache.items() if k[0] == column and k[1] == control]
+                        
+                        test_dict = {d["category"]: d["freq"] for d in test_data}
+                        control_dict = {d["category"]: d["freq"] for d in control_data}
 
                         tmp_dict[f"split: {split} groups: {control}, {test}"] = self._single_calc(test_dict,
                                                                                                   control_dict,
                                                                                                   self.reliability)
                     else:
                         Warning(f"Realization {self.realization} doesn't exist!")
-                        
+
             result[column] = tmp_dict
         return result
-    
+
+    def _aggregator_func_optimized(self, df: pl.DataFrame, column: str, label_column: str) -> pl.DataFrame:
+        """Оптимизированная версия value_counts с explode"""
+        return (
+            df
+            .group_by(label_column)
+            .agg(
+                pl.col(column).value_counts(sort=False).alias("_freq")
+            )
+            .explode("_freq")
+            .with_columns(
+                pl.col("_freq").struct.field("count").alias("freq"),
+                pl.col("_freq").struct.field(column).alias("category"),
+            )
+            .with_columns(
+                pl.lit(column).alias("column")
+            )
+            .select("freq", "category", "column", label_column)
+            .rename({label_column: "group"})
+        )
+
     @staticmethod
     def _aggregator_func(g_df, column: str) -> pl.LazyFrame:
         return (
@@ -323,10 +370,9 @@ class KStest(StaticTest):
             pass
         else:
             raise Exception(f"Incorrect target col format! {type(self.target_columns).__name__}")
-        
-        group_pairs = [(group, self.control_label) for group in range(self.groups_num) if group != self.control_label]
-        # pivot_table = self._statistic_calc()
 
+        group_pairs = [(group, self.control_label) for group in range(self.groups_num) if group != self.control_label]
+        
         result = {}
         for column in self.target_columns:
             tmp_dict = {}
@@ -340,86 +386,81 @@ class KStest(StaticTest):
                                                                                                      test_function=ks_2samp,)
                     result[column] = tmp_dict
                 elif self.realization == 1:
-                    result[column] = self._single_calc(column, group_pairs)
+                    # Оптимизация: вычисляем статистику для всех пар групп за один проход
+                    result[column] = self._single_calc_optimized(column, group_pairs)
                     Warning(f"Realization {self.realization} doesn't exist!")
 
         return result
-    
-    def _statistic_calc(self) -> pl.LazyFrame:
-        return pl.concat([self._single_calc(column, control_label=self.control_label) for column in self.target_columns]).cache()
 
-    def _single_calc(self,
-                    target_column: str, 
-                    group_pairs: List[Tuple[int]],
-                    binary: bool = True,) -> Dict[str, Union[float, bool]]:
-        tmp_table = (
-            self.data
-            # .drop_nulls()
+    def _single_calc_optimized(self, target_column: str, group_pairs: List[Tuple[int, int]]) -> Dict[str, Union[float, bool]]:
+        """Оптимизированная версия - вычисление за один проход для всех пар групп"""
+        df = self._materialize_data()
+        
+        # Оптимизация: фильтруем только нужные группы перед сортировкой
+        control_labels = [ctrl for ctrl, _ in group_pairs] + [self.control_label]
+        control_labels = list(set(control_labels))  # Убираем дубликаты
+        
+        # Фильтруем данные только для нужных групп и сортируем
+        sorted_df = (
+            df
+            .filter(pl.col(self.label_column).is_in(control_labels))
             .select(target_column, self.label_column)
             .sort([target_column, self.label_column])
-            .with_columns(
-                groups_count=pl.col(self.label_column).count().over(self.label_column),
-                edf_over_group=(
-                                    pl.cum_count(target_column)
-                                    .over(self.label_column)
-                                ),
-                        )
-            .with_columns(
-                control_over_control=(
-                                        pl.when(pl.col(self.label_column) == self.control_label)
-                                        .then(pl.col("edf_over_group"))
-                                        .otherwise(0)
-                                        .cum_max()
-                                    ),
-                _test_over_test=(
-                                    pl.when(pl.col(self.label_column) != self.control_label)
-                                    .then(pl.col("edf_over_group"))
-                                    .otherwise(0)
-                                ),
-                _test_count=(
-                                pl.when(pl.col(self.label_column) != self.control_label)
-                                .then(pl.col("groups_count"))
-                                .otherwise(0)
-                ),
-                control_count=(
-                    pl.when(pl.col(self.label_column) == self.control_label)
-                    .then(pl.col("groups_count"))
-                    .otherwise(0)
-                    .max()
-                )
-            )
         )
+        # sorted_df уже DataFrame, collect() не нужен
+        
+        # Вычисляем статистику для каждой пары
         tmp_dict = {}
         for control, test in group_pairs:
-            table = (
-                        tmp_table
-                        .filter((pl.col(self.label_column) == control) | (pl.col(self.label_column) == test))
-                        .with_columns(
-                            test_over_test=pl.col("_test_over_test").cum_max(),
-                            test_count=pl.col("_test_count").max()
-                        )
-                        .with_columns(
-                            statistic=(
-                                (
-                                    pl.col("control_over_control").truediv(pl.col("groups_count")) - 
-                                    pl.col("test_over_test").truediv(pl.col("test_count"))
-                                ).abs()
-                            )
-                        )
-                        .select(
-                            pl.col('statistic').max(),
-                            pl.col('control_count').max(),
-                            pl.col('groups_count').max()
-                        )
-                        .with_columns(
-                            category=pl.lit(target_column),
-                            group=pl.lit(test),
-                            )
-                    ).collect()
-            d = table['statistic'][0]
-            n1 = table['control_count'][0]
-            n2 = table['groups_count'][0]
+            # Фильтруем только нужные группы
+            pair_df = sorted_df.filter(
+                (pl.col(self.label_column) == control) | (pl.col(self.label_column) == test)
+            )
+            
+            # Вычисляем EDF и статистику KS за один проход
+            stats = (
+                pair_df
+                .with_columns(
+                    groups_count=pl.col(self.label_column).count().over(self.label_column),
+                    edf_over_group=pl.cum_count(target_column).over(self.label_column),
+                )
+                .with_columns(
+                    control_edf=pl.when(pl.col(self.label_column) == control)
+                                .then(pl.col("edf_over_group"))
+                                .otherwise(0)
+                                .cum_max(),
+                    test_edf=pl.when(pl.col(self.label_column) == test)
+                              .then(pl.col("edf_over_group"))
+                              .otherwise(0)
+                              .cum_max(),
+                    control_n=pl.when(pl.col(self.label_column) == control)
+                               .then(pl.col("groups_count"))
+                               .otherwise(0)
+                               .max(),
+                    test_n=pl.when(pl.col(self.label_column) == test)
+                             .then(pl.col("groups_count"))
+                             .otherwise(0)
+                             .max(),
+                )
+                .with_columns(
+                    statistic=(
+                        pl.col("control_edf").truediv(pl.col("groups_count")) -
+                        pl.col("test_edf").truediv(pl.col("groups_count"))
+                    ).abs(),
+                )
+                .select(
+                    pl.col('statistic').max().alias('d'),
+                    pl.col('control_n').first().alias('n1'),
+                    pl.col('test_n').first().alias('n2'),
+                )
+            )
+            
+            d = stats['d'][0]
+            n1 = stats['n1'][0]
+            n2 = stats['n2'][0]
+            
             tmp_dict[f"split: {self.k_splits - 1} groups: {control}, {test}"] = self._asymptotic_ks_pvalue(d, n1, n2, self.reliability)
+        
         return tmp_dict
     
     @staticmethod

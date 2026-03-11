@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from .config import test_list, experiment_data
 from ..statistic_realization.spark_statistic import TestingTTest, TestingChiSquare, TestingKStest
 from ..statistic_realization.pandas_statistic import TestingTTestPandas, TestingKStestPandas, TestingChiSquarePandas
@@ -90,23 +92,29 @@ class Experiment():
                 cur_params = dict(zip(list(self.variables.keys()), self.permutations[combination]))
                 if cur_params['fractions'] != 1:
                     if self.data_realization == DataRealization.spark:
-                        cur_data = self.data.sample(fraction=cur_params['fractions'], 
-                                                    seed=self.constants["random_state"], 
+                        cur_data = self.data.sample(fraction=cur_params['fractions'],
+                                                    seed=self.constants["random_state"],
                                                     withReplacement=False)
                     elif self.data_realization == DataRealization.pandas:
                         cur_data = self.data.sample(frac=cur_params['fractions'],
                                                     random_state=self.constants["random_state"],
                                                     replace=False)
                     elif self.data_realization == DataRealization.polars:
+                        # Оптимизация: используем встроенный sample вместо gather
                         if isinstance(self.data, pl.LazyFrame):
-                            np.random.seed(self.constants["random_state"])
-                            n_rows = self.data.select(pl.len()).collect().item()
-                            indices = sorted(np.random.choice(n_rows, size=int(cur_params['fractions'] * n_rows), replace=False))
-                            cur_data = self.data.select(pl.col("*").gather(indices))
+                            cur_data = self.data.sample(
+                                fraction=cur_params['fractions'],
+                                seed=self.constants["random_state"],
+                                with_replacement=False,
+                                shuffle=True
+                            )
                         else:
-                            cur_data = self.data.sample(fraction=cur_params['fractions'],
-                                                        seed=self.constants["random_state"],
-                                                        with_replacement=True).lazy()
+                            cur_data = self.data.sample(
+                                fraction=cur_params['fractions'],
+                                seed=self.constants["random_state"],
+                                with_replacement=False,
+                                shuffle=True
+                            ).lazy()
                 else:
                     cur_data = self.data
 

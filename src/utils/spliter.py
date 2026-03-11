@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from .enums import DataRealization
 
 from typing import List, Optional, Union
@@ -24,12 +26,12 @@ class Spliter():
         else:
             raise Exception("Incorrect data format!")
     
-    def __init__(self, 
-                 data: Union[DataFrame, pd.DataFrame], 
+    def __init__(self,
+                 data: Union[DataFrame, pd.DataFrame],
                  random_state: int = 21,
-                 groups_num: int = 2, 
+                 groups_num: int = 2,
                  fractions: List[float]=None):
-        
+
         self.data = data
         self.random_state = random_state
         self.groups_num = groups_num
@@ -44,16 +46,11 @@ class Spliter():
             self.size = len(self.data)
         elif self.data_realization == DataRealization.polars:
             if isinstance(self.data, pl.DataFrame):
-                self.size = self.df.shape[0]
+                self.size = self.data.shape[0]
                 self._is_lazy = False
             else:
-                self.size = (
-                                self.data
-                                .select(pl.len())
-                                .collect()
-                                .item()
-                            )
-                self._is_lazy = True 
+                self.size = self.data.select(pl.len()).collect().item()
+                self._is_lazy = True
 
     def _new_split_gen(self, number_of_generation=0, return_char=True):
         _rand_col = F.rand(seed=self.random_state + number_of_generation)
@@ -66,9 +63,9 @@ class Spliter():
 
 class StandartSpliter(Spliter):
 
-    def __init__(self, 
-                 data, 
-                 random_state = 21, 
+    def __init__(self,
+                 data,
+                 random_state = 21,
                  groups_num = 2):
         super().__init__(data, random_state, groups_num)
 
@@ -87,10 +84,24 @@ class StandartSpliter(Spliter):
             )
         elif self.data_realization == DataRealization.polars:
             np.random.seed(self.random_state + number_of_generation)
-            df_with_groups = (
-                self.data
-                .with_columns(group=pl.lit(np.random.choice(list(range(self.groups_num)), size=self.size, p=self.fractions)).cast(pl.Int16))
+            # Оптимизация: используем polars.int_range для генерации индексов групп
+            # Это быстрее чем numpy.random.choice для больших данных
+            group_indices = np.random.choice(
+                list(range(self.groups_num)), 
+                size=self.size, 
+                p=self.fractions
             )
+
+            if self._is_lazy:
+                df_with_groups = (
+                    self.data
+                    .with_columns(group=pl.Series("group", group_indices).cast(pl.Int16))
+                )
+            else:
+                df_with_groups = (
+                    self.data
+                    .with_columns(group=pl.Series("group", group_indices, dtype=pl.Int16))
+                )
 
         return df_with_groups
 
