@@ -248,21 +248,26 @@ class TestingChiSquarePandas(StatTest):
         
         return result
     
-    def _iterative_calc(self, 
-                        control_label: int, 
-                        test_label: int, 
-                        target_column: str, 
+    def _iterative_calc(self,
+                        control_label: int,
+                        test_label: int,
+                        target_column: str,
                         label_column: str,
                         **kwargs):
         pivot_table = self._pre_processing(self.data, target_column, label_column)
-        
-        result = chi2_contingency(
+
+        contingency_table = pd.DataFrame(
             [
                 pivot_table.loc[control_label].values,
                 pivot_table.loc[test_label].values
             ],
-            **kwargs
+            index=[control_label, test_label],
+            columns=pivot_table.columns
         )
+        
+        contingency_table = contingency_table.loc[:, contingency_table.sum(axis=0) > 0]
+
+        result = chi2_contingency(contingency_table.values, **kwargs)
 
         return {
                     "p-value": result.pvalue,
@@ -305,17 +310,23 @@ class TestingChiSquarePandas(StatTest):
     
     def _single_column_calc(self,
                             pivot_table: pd.DataFrame,
-                            target_column: str, 
-                            test: int, 
-                            control: int, 
+                            target_column: str,
+                            test: int,
+                            control: int,
                             split_idx: int) -> dict[str, Union[float, bool]]:
-        
-        result = chi2_contingency(
+
+        contingency_table = pd.DataFrame(
             [
                 pivot_table.loc[(split_idx, control), target_column].sort_index().values,
                 pivot_table.loc[(split_idx, test), target_column].sort_index().values
             ],
+            index=[control, test],
+            columns=pivot_table.columns.get_level_values(1).unique()
         )
+        
+        contingency_table = contingency_table.loc[:, contingency_table.sum(axis=0) > 0]
+
+        result = chi2_contingency(contingency_table.values)
 
         return {
                     "p-value": result.pvalue,
