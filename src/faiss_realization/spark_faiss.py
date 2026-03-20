@@ -203,6 +203,8 @@ class FaissSpark:
         Args
         ----
         """
+        import faiss
+        import numpy as np
         index = faiss.deserialize_index(bc_index.value)
 
         ids, vectors = [], []
@@ -342,6 +344,8 @@ class FaissSpark:
             n_neighbors: `int`
                 Количество соседей для поиска.
         """
+        import faiss
+        import numpy as np
         query = np.array(query.value, dtype=np.float32).reshape(1, -1)
         for shard in shard_iter:
             index = faiss.deserialize_index(shard)
