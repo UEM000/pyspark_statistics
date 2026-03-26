@@ -15,6 +15,8 @@ from typing import (
     Iterable,
     Tuple,
 )
+from tqdm import tqdm
+
 class FaissSpark:
     """
     Реализация faiss на pyspark:
@@ -43,6 +45,8 @@ class FaissSpark:
     """
     PERSIST_POLITIC = StorageLevel.MEMORY_AND_DISK
     _SAMPLE_TARGET = 5_000_000
+    # Лимит на то, сколько локальых индексов может быть одновременно загружено на драйвер
+    DRIVER_INDEX_LIMIT = 5_000_000 
 
     def __init__(self,
                  n_neighbors: int = 1,
@@ -222,7 +226,8 @@ class FaissSpark:
         index_with_ids = faiss.IndexIDMap(index)
         index_with_ids.add_with_ids(vectors, ids)
 
-        yield index_with_ids
+        # yield index_with_ids
+        yield faiss.serialize_index(index_with_ids)
 
     def _direct_predict(self, test_data: spark.DataFrame) -> List[List[Union[int, float]]]:
         """
@@ -290,7 +295,7 @@ class FaissSpark:
     def _partition_predict(self, test_data: spark.DataFrame) -> List[List[Union[int, float]]]:
         """
         Реализация partition faiss predict.
-
+s
         Args
         ----
             test_data : `spark.DataFrame`
@@ -304,25 +309,83 @@ class FaissSpark:
         session = self._clustered_data.sparkSession
         X = np.array([list(row['features']) for row in rows], dtype=np.float32)
         results = []
+        partition_number = self._sharded_rdd.getNumPartitions()
+        batch_size = max(1, self.DRIVER_INDEX_LIMIT // (partition_number * self.n_neighbors))
+        print(f"Predict will be executed by {(len(X) // batch_size)} batches")
 
-        for query_idx, query in enumerate(X): 
-            bc_query = session.sparkContext.broadcast(query)
+        for batch_idx in tqdm(
+                range((len(X) // batch_size) + 1),
+                desc="Predict executing. Batch computed",
+                colour="green"
+            ):
+            batch = X[batch_idx * batch_size : (batch_idx + 1) * batch_size]
+            if len(batch) == 0:
+                continue
+
+            bc_batch = session.sparkContext.broadcast(batch)
+            bc_n_neighbors = session.sparkContext.broadcast(self.n_neighbors)
             tmp = (
                 self._sharded_rdd
                 .mapPartitions(lambda it:
-                               FaissSpark._per_partition_predict(it, bc_query))
-                .takeOrdered(num=self.n_neighbors, key=lambda x: x[0])
+                               FaissSpark._per_partition_batch_predict(it, bc_batch, bc_n_neighbors))
+                .collect()
             )
+            per_query = defaultdict(list)
+            for q_idx, idx, dist in tmp:
+                per_query[q_idx].append((idx, dist))
+            
+            for q_idx in per_query.keys():
+                q_result = sorted(per_query[q_idx], key=lambda x: x[1])[:self.n_neighbors]
+                results.extend([
+                    (batch_idx * batch_size + q_idx, idx, dist) for idx, dist in q_result
+                    ])
 
-            results.extend(
-                [(query_idx, tmp_index, tmp_dist) for tmp_dist, tmp_index in tmp]
-            )
-            bc_query.unpersist()
         return results
+    
+    @staticmethod
+    def _per_partition_batch_predict(
+        shard_iter: Iterable, 
+        bc_batch: Broadcast, 
+        n_neighbors : Broadcast,
+    ):
+        """
+        Predict локально на каждой партиции.
+
+        Args
+        ----
+            shard_iter: `Iterable`
+                Итератор с шардами индексов.
+
+            query: `np.ndarray`
+                Вектор запроса (передаётся напрямую, сериализуется корректно).
+
+            n_neighbors: `int`
+                Количество соседей для поиска.
+        """
+        import faiss
+        import numpy as np
+        batch = bc_batch.value
+        # batch_result = []
+
+        for shard in shard_iter:
+            # index = shard
+            index = faiss.deserialize_index(shard)
+            if index.ntotal == 0:
+                continue
+
+            k = min(n_neighbors.value, index.ntotal)
+            for idx, query in enumerate(batch):
+                q_distances, q_ids = index.search(query.reshape(1, -1), k)
+
+                for i in range(k):
+                    if q_ids[0][i] >= 0:
+                        # batch_result.append((idx, q_distances, q_ids)) 
+                        yield (idx, int(q_ids[0][i]), float(q_distances[0][i]))   
 
     @staticmethod
-    def _per_partition_predict(shard_iter: Iterable, 
+    def _per_partition_predict(shard_iter: Iterable,  #TODO: remove
                                query: Broadcast, 
+                               n_neighbors : Broadcast
     ):
         """
         Predict локально на каждой партиции.
@@ -348,7 +411,7 @@ class FaissSpark:
             if index.ntotal == 0:
                 continue
 
-            k = min(10, index.ntotal)
+            k = min(n_neighbors.value, index.ntotal)
             distances, ids = index.search(query, k)
 
 
