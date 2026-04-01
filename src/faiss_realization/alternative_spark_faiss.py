@@ -2,10 +2,17 @@ import numpy as np
 import pyspark.sql as spark
 import pyspark.sql.functions as F
 import faiss
+import os
+import sys
 
 from pyspark.ml.feature import VectorAssembler
-from pyspark.ml.clustering import KMeans
 from pyspark import StorageLevel, Broadcast, RDD
+from pyspark.sql.types import (
+    StructType, 
+    StructField, 
+    LongType,
+    FloatType
+)
 from collections import defaultdict
 from typing import (
     Union,
@@ -21,56 +28,78 @@ class FaissSpark:
     """
     Реализация faiss на pyspark:
     ---------
-        * **Большие данные** (> 1_000_000):
-            1. Кластеризация данных;
-            2. Используем faiss для кластера, а не для всего датасета.
+        * **Большие данные**:
+            1. Обучаем IVF на сэмпле из данных;
+            2. Строим для каждой партиции индекс;
+            3. После локального поиска соседей в партиции выбираем
+               среди лучших самые ближайшие.
         * **Маленькие данные**:
-            1. Преобрауем датасет в pandas;
-            2. Используем faiss на нашем датасете.
+            1. Собирает все данные на драйвере и строит один faiss индекс.
 
     Modes
     -----
-        **base**        : Собирает все данные  на драйвере и строит один faiss индекс.
+        **base**        : Собирает все данные на драйвере и строит один faiss индекс.
                         Используется только при небольшом количестве данных.
-        
-        **fast**        : Предварительная кластеризация данных и построение индекса локально
-                        на ближайшем кластере. Используется для больших датасетов.
-        
-        **partition**   : обучаем IVF на сэмпле из данных. Далее строим для каждой партиции
+
+        **partition**   : Обучаем IVF на сэмпле из данных. Далее строим для каждой партиции
                           индекс и после локального поиска соседей в партиции, выбираем
                           среди лучших самые ближайшие. Используется для больших датасетов.
 
-        **auto**        : автоматический выбор режима. 
-                        По-умолчанию `fast`.
+        **auto**        : автоматический выбор режима.
+                        По-умолчанию `partition`.
     """
     PERSIST_POLITIC = StorageLevel.MEMORY_AND_DISK
     _SAMPLE_TARGET = 5_000_000
     # Лимит на то, сколько локальых индексов может быть одновременно загружено на драйвер
     DRIVER_INDEX_LIMIT = 5_000_000 
+    PREDICT_SCHEMA = StructType([
+        StructField("_id",         LongType(),  False),
+        StructField("neighbor_id", LongType(),  False),
+        StructField("distance",    FloatType(), False),
+    ])
 
-    def __init__(self,
-                 n_neighbors: int = 1,
-                 k: int = 1000,
-                 seed: Union[int, None] = None,
-                 feature_cols: Union[List[str], None] = None,
-                 faiss_mode: Literal["base", "fast", "partition", "auto"] = "auto",
-                 ):
+    def __init__(
+            self,
+            n_neighbors: int = 1,
+            k: int = 1000,
+            seed: Union[int, None] = None,
+            feature_cols: Union[List[str], None] = None,
+            faiss_mode: Literal["base", "partition", "auto"] = "auto",
+    ):
+        """
+        Args
+        ----
+            n_neighbors: `int`
+                количество соседей для каждого запроса;
+
+            k: `int`
+                количество кластеров для пстроения FAISS IFV;
+
+            seed: `Union[int, None]`
+                зерно генерации для внутренних методов, по-умолчания `None`;
+
+            feature_cols: `Union[List[str], None]`
+                фичи по которым ищем соседей, по-умолчанию `None`;
+
+            faiss_mode: `Literal["base", "partition", "auto"]`
+                выбор алгоритма поиска соедей, по-умолчанию "auto".
+                В "auto" моде выбирается режим в зависимости от размера выборки.
+        """
         self.n_neighbors = n_neighbors
-        self.k = k 
+        self.k = k
         self.seed = seed or 21
         self.feature_cols = feature_cols
         self.faiss_mode = faiss_mode
 
-        self._kmeans_model = None
         self._index = None
-        self._id_map: Optional[np.ndarray] = None
-        self._centroid_index: Optional[faiss.Index] = None
-        self._centroid_list: Optional[List[np.ndarray]] = None
         self._clustered_data: Optional[spark.DataFrame] = None
-        self._mode: Optional[Literal["base", "fast"]] = None
+        self._mode: Optional[Literal["base", "partition"]] = None
         self._sharded_rdd: Optional[RDD] = None
 
-    def _vectorize_data(self, data: spark.DataFrame) -> spark.DataFrame:
+    def _vectorize_data(
+            self, 
+            data: spark.DataFrame
+    ) -> spark.DataFrame:
         """
         Подготовка входных данных: векторизация и проверка на категориальные фичи.
         Все незакодированные фичи будут вызывать ошибку работы / (в дальнейшем просто выкидываться?).
@@ -104,7 +133,10 @@ class FaissSpark:
                     .withColumn('_id', F.monotonically_increasing_id()) # Колонка с уникальным идентификатором строки
                 )
 
-    def _direct_fit(self, data: spark.DataFrame) -> None:
+    def _direct_fit(
+            self, 
+            data: spark.DataFrame
+    ) -> None:
         """
         Прямое вычисление faiss с выгрузкой данных на драйвер.
 
@@ -120,32 +152,10 @@ class FaissSpark:
         self._index = faiss.IndexFlatL2(X.shape[1])
         self._index.add(X)
 
-    def _clustered_fit(self, data: spark.DataFrame) -> None:
-        """
-        Кластеризация данных спомощью Spark KMeans и построение
-        индекса центроидов на драйвере. Центроиды будут использоваться
-        при поиске соседей для запросов для уменьшения потребления памяти.
-
-        Args
-        ----
-            data: `spark.DataFrame`
-                Данные для которых мы ищем соседей.
-        """
-        prepeared_data = self._vectorize_data(data)
-        df_clustered = self._clustering(prepeared_data)
-        select_cols = ["_id", "cluster_id", "features"]
-        self._clustered_data = (
-            df_clustered
-            .select(*select_cols)
-            .persist(self.PERSIST_POLITIC)
-        )
-        self._clustered_data.count()
-        
-        X = np.array(self._centroid_list, dtype=np.float32)
-        self._centroid_index= faiss.IndexFlatL2(X.shape[1])
-        self._centroid_index.add(X)
-
-    def _partition_fit(self, data: spark.DataFrame) -> None:
+    def _partition_fit(
+            self, 
+            data: spark.DataFrame
+    ) -> None:
         """
         Реализация partition faiss fit. 
         Предполагается, что будет браться sample данных, 
@@ -162,6 +172,8 @@ class FaissSpark:
         ------
             None
         """
+        import gc
+
         prepeared_data = self._vectorize_data(data)
         self._clustered_data = prepeared_data
         session = data.sparkSession
@@ -185,33 +197,48 @@ class FaissSpark:
         nlist = min(self.k, max(1, X.shape[0] // 39)) 
 
         quantizer = faiss.IndexFlatL2(d)
-        self._index = faiss.IndexIVFFlat(quantizer, d, self.k)
+        self._index = faiss.IndexIVFFlat(quantizer, d, nlist)
         self._index.train(X)
 
         bc_index = session.sparkContext.broadcast(self._index)
+        del self._index
+        self._index = None
+        gc.collect()
 
         features = ["_id", "features"]
         self._sharded_rdd = (
             prepeared_data
             .select(*features)
             .rdd
-            .mapPartitions(lambda it: FaissSpark._patition_faiss(it, bc_index))
+            .mapPartitions(lambda it: FaissSpark._partition_faiss(it, bc_index))
             .persist(self.PERSIST_POLITIC)
         )
         self._sharded_rdd.count()
 
     @staticmethod
-    def _patition_faiss(iterator: Iterable, bc_index: Broadcast):
+    def _partition_faiss(
+        iterator: Iterable, 
+        bc_index: Broadcast
+    ):
         """
         Fit на локально на каждой партиции на осонвании данных из sample-а.
 
         Args
         ----
+            iterator: Iterable
+                итератор внутри партиции. 
+            
+            bc_index: Broadcast
+                заброадкащенный индекс.
+        
+        Return
+        ------
+            `Generator`: сериализованный индекс из каждой партиции.
         """
         import faiss
         import numpy as np
-        index = bc_index.value
 
+        index = bc_index.value
         ids, vectors = [], []
         for row in iterator:
             ids.append(row["_id"])
@@ -229,10 +256,15 @@ class FaissSpark:
         # yield index_with_ids
         yield faiss.serialize_index(index_with_ids)
 
-    def _direct_predict(self, test_data: spark.DataFrame) -> List[List[Union[int, float]]]:
+    def _direct_predict(
+            self, 
+            test_data: spark.DataFrame
+    ) -> List[List[Union[int, float]]]:
         """
-        Нахождение индексов прямым методом faiss.
+        Нахождение индексов прямым методом faiss:
+        собирает датасет и индексы на драйвере и ищет похоиъ.
         """
+        session = test_data.sparkSession
         rows = test_data.select("features").collect()
         X = np.array([list(row.features) for row in rows], dtype=np.float32)
         dist, pos_indexes = self._index.search(X, k=self.n_neighbors)
@@ -245,57 +277,34 @@ class FaissSpark:
                 original_id = int(self._id_map[pos]) if pos >= 0 else -1
                 distance = float(dist[query_idx][i])
                 result.append((query_idx, original_id, distance))        
-        return result
     
-    def _clustering_predict(self, test_data: spark.DataFrame) -> List[List[Union[int, float]]]:
-        """
-        Нахождение индексов с помощью кластеризации.
-        """
-        result = []
-        rows = test_data.select("features").collect()
-        X = np.array([list(row.features) for row in rows], dtype=np.float32)
-        _, cluster_ids = self._centroid_index.search(X, k=1)
-        # В spark KMeans центроиды возвращаются в соответствии с порядковым номером их кластера
-        # Поэтому индекс сразу указывает нам на то, какой кластер нам нужен
-        cluster_to_queries = defaultdict(list)
-        for query_idx, cluster_idx in enumerate(cluster_ids.flatten()):
-            cluster_to_queries[cluster_idx].append(query_idx)
+        return session.createDataFrame(result, schema=FaissSpark.PREDICT_SCHEMA)
 
-        for cluster_idx, query_idx_list in cluster_to_queries.items():
-            cluster_rows = (
-                self._clustered_data
-                .filter(F.col('cluster_id') == cluster_idx)
-                .select("features")
-                .collect()
-            )
-            
-            # Проверка на пустой кластер
-            if len(cluster_rows) == 0:
-                for query_idx in query_idx_list:
-                    result.append((query_idx, -1, float('inf')))
-                continue
-            
-            cluster_data = np.array(
-                [list(row.features) for row in cluster_rows],
-                dtype=np.float32
-            )
-            tmp_index = faiss.IndexFlatL2(cluster_data.shape[1])
-            tmp_index.add(cluster_data)
-            k = min(self.n_neighbors, len(cluster_data))
-            for query_idx in query_idx_list:
-                r_dist, r_indexes = tmp_index.search(X[query_idx: query_idx+1], k=k)
-                # Возвращаем результат: (query_idx, neighbor_idx, distance)
-                for i in range(k):
-                    neighbor_idx = int(r_indexes[0][i])
-                    distance = float(r_dist[0][i])
-                    result.append((query_idx, neighbor_idx, distance))
-        
-        return result
-    
-    def _partition_predict(self, test_data: spark.DataFrame) -> List[List[Union[int, float]]]:
+    def _partition_predict(
+            self, 
+            test_data: spark.DataFrame
+    ) -> RDD[list]:
         """
         Реализация partition faiss predict.
-s
+
+        Steps
+        -----
+        1. Итеративно получаем сериализованные индексы с каждой партиции и
+        записывем их в файл с расширегием `.index`, которое умеет обрабатывать faiss.
+
+        2. Отправляем `.index` файлы на все партиции test-data, для которой ищем соседей
+        в train-data.
+
+        3. На каждой партиции итеративно загружаем в RAM строку test-data, 
+        и для нее итеративно подгружаем файл с индексами, где ищем top_k = 
+        n_neighbors, после чего удаляем индекс из оперативной памяти.
+
+        4. Результаты обернуты в `Spark.Dataframe` с схемой 
+        (_id `LongType`, neighbor_id `LongType`, distance `FloatType`).
+
+        5. Удаление временных файлов и временной директории после материализации
+        результатов в датафрейм.
+
         Args
         ----
             test_data : `spark.DataFrame`
@@ -303,45 +312,132 @@ s
 
         Return
         ------
-            None
+            result: `RDD' результирующая таблица с индексами соседей и расстоянием до них
         """
-        rows = test_data.select("features").collect()
-        session = self._clustered_data.sparkSession
-        X = np.array([list(row['features']) for row in rows], dtype=np.float32)
-        results = []
-        partition_number = self._sharded_rdd.getNumPartitions()
-        batch_size = max(1, self.DRIVER_INDEX_LIMIT // (partition_number * self.n_neighbors))
-        print(f"Predict will be executed by {(len(X) // batch_size)} batches")
+        import gc
 
-        for batch_idx in tqdm(
-                range((len(X) // batch_size) + 1),
-                desc="Predict executing. Batch computed",
-                colour="green"
-            ):
-            batch = X[batch_idx * batch_size : (batch_idx + 1) * batch_size]
-            if len(batch) == 0:
-                continue
+        session = test_data.sparkSession
+        tmp_dir = "__partition_indexes"
+        # if os.
+        os.makedirs(tmp_dir, exist_ok=True) 
+        # os.mkdir(tmp_dir)
+        index_files_list = []
 
-            bc_batch = session.sparkContext.broadcast(batch)
-            bc_n_neighbors = session.sparkContext.broadcast(self.n_neighbors)
-            tmp = (
-                self._sharded_rdd
-                .mapPartitions(lambda it:
-                               FaissSpark._per_partition_batch_predict(it, bc_batch, bc_n_neighbors))
-                .collect()
-            )
-            per_query = defaultdict(list)
-            for q_idx, idx, dist in tmp:
-                per_query[q_idx].append((idx, dist))
+        for partition_index, shard in enumerate(self._sharded_rdd.toLocalIterator()):
+            partition_indexes = faiss.deserialize_index(shard)
+            index_file_name = f"__{partition_index}_partition_index.index"
+            faiss.write_index(
+                partition_indexes,
+                f"./{tmp_dir}/{index_file_name}" 
+            )    
+            session.sparkContext.addFile(f"./{tmp_dir}/{index_file_name}")
+            index_files_list.append(index_file_name)
+
+            del partition_indexes   # ← explicit release
+            gc.collect()
+
+        bc_index_files_list = session.sparkContext.broadcast(index_files_list)
+        bc_n_neighbors = session.sparkContext.broadcast(self.n_neighbors)
+
+        result_rdd = test_data.rdd.mapPartitions(lambda it:
+                                       FaissSpark._per_partition_predict(
+                                            it, 
+                                            bc_n_neighbors=bc_n_neighbors, 
+                                            bc_index_files_list=bc_index_files_list)
+        )
+
+        result_df = (
+            session.createDataFrame(result_rdd, schema=FaissSpark.PREDICT_SCHEMA)
+            .persist(self.PERSIST_POLITIC)
+        )
+        result_df.count()
+        
+        # Удаляем все созданные промежуточные файлы
+        tmp_files = os.listdir(tmp_dir)
+        for file in tmp_files:
+            os.remove(f"{tmp_dir}/{file}")
+        os.rmdir(tmp_dir)
+
+        return result_df 
+
+    @staticmethod
+    def  _per_partition_predict(
+        shard_iter: Iterable,
+        bc_n_neighbors: Broadcast,
+        bc_index_files_list: Broadcast
+    ):
+        """
+        Predict локально на каждой партиции.
+
+        Из загруженных `.index` файлов итеративно создаем для каждой строки в датафрейме
+        новую колонку, где будут находится ближайшие соседи.
+
+        Args
+        ----
+            shard_iter: `Iterable`
+                Итератор по партиции.
+
+            bc_n_neighbors: `Broadcast`
+                Количество соседей для поиска.
+
+            bc_index_files_list: `Broadcast`
+                Список из номеров файлов, где хранятся построенные индексы каждой партиции.  
+        """
+        import faiss
+        import numpy as np
+        from pyspark import SparkFiles
+        import gc
+
+        real_n = bc_n_neighbors.value
+        index_files = bc_index_files_list.value
+
+        ## Реализация батчами с полной выгрузкой партиции
+        rows = list(shard_iter) 
+        if not rows:
+            return
+
+        query_ids = np.array([r["_id"] for r in rows], dtype=np.int64)
+        batch = np.array([list(r["features"]) for r in rows], dtype=np.float32)  # (Q, d)
+        del rows
+        gc.collect()        
+
+        candidates = [[] for _ in range(len(query_ids))]
+        for index_file in index_files:
+            # --- ONLY ONE INDEX IN RAM AT A TIME ---
+            tmp_index = faiss.read_index(SparkFiles.get(index_file))
+            k = min(real_n, tmp_index.ntotal)
+            dists, nids = tmp_index.search(batch, k)   # (Q, k)
+            del tmp_index   # release before next iteration
+            gc.collect()
+
+            for q_idx in range(len(query_ids)):
+                for rank in range(k):
+                    nid = int(nids[q_idx, rank])
+                    if nid >= 0:  # FAISS returns -1 for padding
+                        candidates[q_idx].append((float(dists[q_idx, rank]), nid))
+
+        # Emit top-n per query, sorted by distance (ascending)
+        for q_idx, qid in enumerate(query_ids):
+            top = sorted(candidates[q_idx], key=lambda x: x[0])[:real_n]
+            for dist, nid in top:
+                yield (int(qid), nid, dist)
+
+
+        # # реализация итеративная, а не батчами
+        # for element in shard_iter:
+        #     top_n_list = []
+        #     vec = list(element["features"])
+        #     for index_file in index_files:
+        #         tmp_index = faiss.read_index(SparkFiles.get(index_file))
+        #         np_element = np.array(vec, dtype=np.float32).reshape(1, -1)
+        #         dists, indexes = tmp_index.search(np_element, real_n)
+        #         top_n_list.extend(list(zip(indexes[0], dists[0])))
+        #         del tmp_index   # ← release before next load
+        #         gc.collect()
+        #     top_n_list = sorted(top_n_list, key=lambda x: x[1])[:real_n]
+        #     yield top_n_list
             
-            for q_idx in per_query.keys():
-                q_result = sorted(per_query[q_idx], key=lambda x: x[1])[:self.n_neighbors]
-                results.extend([
-                    (batch_idx * batch_size + q_idx, idx, dist) for idx, dist in q_result
-                    ])
-
-        return results
-    
+            
     @staticmethod
     def _per_partition_batch_predict(
         shard_iter: Iterable, 
@@ -365,94 +461,24 @@ s
         import faiss
         import numpy as np
         batch = bc_batch.value
-        # batch_result = []
 
         for shard in shard_iter:
-            # index = shard
             index = faiss.deserialize_index(shard)
             if index.ntotal == 0:
                 continue
 
             k = min(n_neighbors.value, index.ntotal)
-            for idx, query in enumerate(batch):
-                q_distances, q_ids = index.search(query.reshape(1, -1), k)
+            distances, ids = index.search(batch, k)
 
+            for q_idx in range(len(batch)):
                 for i in range(k):
-                    if q_ids[0][i] >= 0:
-                        # batch_result.append((idx, q_distances, q_ids)) 
-                        yield (idx, int(q_ids[0][i]), float(q_distances[0][i]))   
+                    if ids[q_idx][i] >= 0:
+                        yield (q_idx, int(ids[q_idx][i]), float(distances[q_idx][i]))      
 
-    @staticmethod
-    def _per_partition_predict(shard_iter: Iterable,  #TODO: remove
-                               query: Broadcast, 
-                               n_neighbors : Broadcast
-    ):
-        """
-        Predict локально на каждой партиции.
-
-        Args
-        ----
-            shard_iter: `Iterable`
-                Итератор с шардами индексов.
-
-            query: `np.ndarray`
-                Вектор запроса (передаётся напрямую, сериализуется корректно).
-
-            n_neighbors: `int`
-                Количество соседей для поиска.
-        """
-        import faiss
-        import numpy as np
-        query = np.array(query.value, dtype=np.float32).reshape(1, -1)
-
-
-        for shard in shard_iter:
-            index = shard
-            if index.ntotal == 0:
-                continue
-
-            k = min(n_neighbors.value, index.ntotal)
-            distances, ids = index.search(query, k)
-
-
-            for i in range(k):
-                if ids[0][i] >= 0:
-                    yield (float(distances[0][i]), int(ids[0][i]))        
-    
-    def _clustering(self, data: spark.DataFrame) -> spark.DataFrame:
-        """
-        Разбиение на кластеры для дальнейшего использования faiss для каждого кластера.
-
-        Agrs
-        ----
-            data : `SparkDataFrame`
-                Подготовленные данные с помощью _vectorize_data
-        
-        Returns
-        -------
-            df_clustered : `SparkDataFrame`
-                Датафрейм с колонкой пренадлежности к кластеру.
-        """
-        # vectorized_data = self._vectorize_data(data)
-        self._kmeans_model = KMeans(
-            k=self.k, 
-            seed=self.seed,
-            featuresCol="features",
-            predictionCol='cluster_id'
-        )
-        self._kmeans_model = self._kmeans_model.fit(data)
-        df_clustered = self._kmeans_model.transform(data)
-        self._centroid_list = self._kmeans_model.clusterCenters()
-
-        return df_clustered
-
-    def _parametrs_tuning(self):
-        """
-        Тюнинг параметров.
-        """
-          
-
-    def _calculation_mode(self, count: int) -> Literal["base", "fast", "partition"]:
+    def _calculation_mode(
+            self, 
+            count: int
+    ) -> Literal["base", "partition"]:
         """
         Выбор типа вычисления faiss.
 
@@ -460,15 +486,22 @@ s
         -----
             count: `int`
                 Количество строка в датафрейме.
-        """
-        if self.faiss_mode in ("base", "fast", "partition"):
-            return self.faiss_mode 
         
+        Return
+        ------
+            `Literal["base", "partition"]`: вариант реализации алгоритма.
+        """
+        if self.faiss_mode in ("base", "partition"):
+            return self.faiss_mode
+
         if count > 1_000_000:
-            return "fast"
+            return "partition"
         return "base"
     
-    def fit(self, data: spark.DataFrame) -> "FaissSpark":
+    def fit(
+            self, 
+            data: spark.DataFrame
+    ) -> "FaissSpark":
         """
         Fit.
 
@@ -482,19 +515,18 @@ s
 
         if self._mode == "base":
             self._direct_fit(data)
-        elif self._mode == "fast":
-            self._clustered_fit(data)
         elif self._mode == "partition":
             self._partition_fit(data)
 
         return self
     
     def predict(
-            self, test_data: spark.DataFrame
+            self, 
+            test_data: spark.DataFrame
     ) -> List[Tuple[int, int, float]]:
         """
         Predict.
-        
+
         Returns
         -------
         result : `List[Tuple[int, int, float]]`
@@ -504,13 +536,11 @@ s
 
         if self._mode == "base":
             result = self._direct_predict(prepeared_data)
-        elif self._mode == "fast":
-            result = self._clustering_predict(prepeared_data)
         elif self._mode == "partition":
             result = self._partition_predict(prepeared_data)
         else:
             raise RuntimeError("Модель не обучена. Вызовите fit() перед predict().")
-        
+
         return result
 
     def unpersist(self) -> None:
