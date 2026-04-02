@@ -57,6 +57,7 @@ class FaissSpark:
         StructField("neighbor_id", LongType(),  False),
         StructField("distance",    FloatType(), False),
     ])
+    CHUMK_SIZE = 512
 
     def __init__(
             self,
@@ -338,12 +339,15 @@ class FaissSpark:
 
         bc_index_files_list = session.sparkContext.broadcast(index_files_list)
         bc_n_neighbors = session.sparkContext.broadcast(self.n_neighbors)
+        bc_chunk_size = session.sparkContext.broadcast(self.CHUMK_SIZE)
 
         result_rdd = test_data.rdd.mapPartitions(lambda it:
-                                       FaissSpark._per_partition_predict(
-                                            it, 
-                                            bc_n_neighbors=bc_n_neighbors, 
-                                            bc_index_files_list=bc_index_files_list)
+                                        FaissSpark._per_partition_predict(
+                                        it, 
+                                        bc_n_neighbors=bc_n_neighbors, 
+                                        bc_index_files_list=bc_index_files_list,
+                                        bc_chunk_size=bc_chunk_size
+            )
         )
 
         result_df = (
@@ -364,7 +368,8 @@ class FaissSpark:
     def  _per_partition_predict(
         shard_iter: Iterable,
         bc_n_neighbors: Broadcast,
-        bc_index_files_list: Broadcast
+        bc_index_files_list: Broadcast,
+        bc_chunk_size: Broadcast
     ):
         """
         Predict локально на каждой партиции.
@@ -387,40 +392,55 @@ class FaissSpark:
         import numpy as np
         from pyspark import SparkFiles
         import gc
-
+            
         real_n = bc_n_neighbors.value
         index_files = bc_index_files_list.value
-
+        chunk_size = bc_chunk_size.value
+   
         ## Реализация батчами с полной выгрузкой партиции
-        rows = list(shard_iter) 
-        if not rows:
-            return
+        def iter_chunk(it: Iterable, chunk_size: int):
+            chunk = []
+            amount = 0
+            for row in it:
+                chunk.append(row)
+                amount += 1
 
-        query_ids = np.array([r["_id"] for r in rows], dtype=np.int64)
-        batch = np.array([list(r["features"]) for r in rows], dtype=np.float32)  # (Q, d)
-        del rows
-        gc.collect()        
+                if amount >= chunk_size:
+                    amount = 0
+                    yield chunk
+                    chunk =[]
+                
+            if chunk:
+                yield chunk
+        
+        for chunk in iter_chunk(shard_iter, chunk_size):
+            if not chunk:
+                return
+            query_ids = np.array([r["_id"] for r in chunk], dtype=np.int64)
+            batch = np.array([list(r["features"]) for r in chunk], dtype=np.float32)  # (Q, d)
+            del chunk
+            gc.collect()        
 
-        candidates = [[] for _ in range(len(query_ids))]
-        for index_file in index_files:
-            # --- ONLY ONE INDEX IN RAM AT A TIME ---
-            tmp_index = faiss.read_index(SparkFiles.get(index_file))
-            k = min(real_n, tmp_index.ntotal)
-            dists, nids = tmp_index.search(batch, k)   # (Q, k)
-            del tmp_index   # release before next iteration
-            gc.collect()
+            candidates = [[] for _ in range(len(query_ids))]
+            for index_file in index_files:
+                # --- ONLY ONE INDEX IN RAM AT A TIME ---
+                tmp_index = faiss.read_index(SparkFiles.get(index_file))
+                k = min(real_n, tmp_index.ntotal)
+                dists, nids = tmp_index.search(batch, k)   # (Q, k)
+                del tmp_index   # release before next iteration
+                gc.collect()
 
-            for q_idx in range(len(query_ids)):
-                for rank in range(k):
-                    nid = int(nids[q_idx, rank])
-                    if nid >= 0:  # FAISS returns -1 for padding
-                        candidates[q_idx].append((float(dists[q_idx, rank]), nid))
+                for q_idx in range(len(query_ids)):
+                    for rank in range(k):
+                        nid = int(nids[q_idx, rank])
+                        if nid >= 0:  # FAISS returns -1 for padding
+                            candidates[q_idx].append((float(dists[q_idx, rank]), nid))
 
-        # Emit top-n per query, sorted by distance (ascending)
-        for q_idx, qid in enumerate(query_ids):
-            top = sorted(candidates[q_idx], key=lambda x: x[0])[:real_n]
-            for dist, nid in top:
-                yield (int(qid), nid, dist)
+            # Emit top-n per query, sorted by distance (ascending)
+            for q_idx, qid in enumerate(query_ids):
+                top = sorted(candidates[q_idx], key=lambda x: x[0])[:real_n]
+                for dist, nid in top:
+                    yield (int(qid), nid, dist)
 
 
         # # реализация итеративная, а не батчами
