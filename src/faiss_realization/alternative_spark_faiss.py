@@ -23,6 +23,8 @@ from typing import (
     Tuple,
 )
 from tqdm import tqdm
+            
+    
 
 class FaissSpark:
     """
@@ -47,6 +49,30 @@ class FaissSpark:
 
         **auto**        : автоматический выбор режима.
                         По-умолчанию `partition`.
+
+    Realization
+    -----------
+    fit() на train_data
+    └─> _partition_fit()
+        └─> На КАЖДОМ executor'е строится IndexIDMap (IVFFlat + векторы партиции)
+            └─> Сериализуется в байты через faiss.serialize_index()
+                └─> RDD персистится в памяти
+
+    predict() на test_data
+    └─> _partition_predict()
+        ├─> toLocalIterator() — ПОСЛЕДОВАТЕЛЬНО забираем байты с executor'ов на драйвер
+        │   ├─> deserializable в FAISS объект
+        │   ├─> Запись в файл .index на драйвере
+        │   └─> sparkContext.addFile() — рассылает на ВСЕ executor'ы
+        │
+        └─> mapPartitions на test_data:
+            └─> На КАЖДОМ executor'е test_data:
+                ├─> Для каждого батча запросов:
+                │   └─> Для КАЖДОГО .index файла (все партиции train):
+                │       ├─> read_index() — загрузка в RAM
+                │       ├─> search(batch, k)
+                │       └─> del index + gc.collect()
+                └─> Merge кандидатов и top-k
     """
     PERSIST_POLITIC = StorageLevel.MEMORY_AND_DISK
     _SAMPLE_TARGET = 5_000_000
@@ -336,7 +362,7 @@ class FaissSpark:
 
             del partition_indexes   # ← explicit release
             gc.collect()
-
+        session.sparkContext.addPyFile("index_cacher.py")
         bc_index_files_list = session.sparkContext.broadcast(index_files_list)
         bc_n_neighbors = session.sparkContext.broadcast(self.n_neighbors)
         bc_chunk_size = session.sparkContext.broadcast(self.CHUMK_SIZE)
@@ -392,10 +418,19 @@ class FaissSpark:
         import numpy as np
         from pyspark import SparkFiles
         import gc
+        import builtins
+        from index_cacher import get_executor_cache
+
+        # One shared cache across ALL partition tasks on this executor worker
+        cache = get_executor_cache(max_index=2)
             
         real_n = bc_n_neighbors.value
         index_files = bc_index_files_list.value
         chunk_size = bc_chunk_size.value
+        # if not hasattr(builtins, '_faiss_cache'):
+        #     builtins._faiss_cache = CachingIndex(max_index=2)
+
+        # cache = builtins._faiss_cache
    
         ## Реализация батчами с полной выгрузкой партиции
         def iter_chunk(it: Iterable, chunk_size: int):
@@ -423,20 +458,20 @@ class FaissSpark:
 
             candidates = [[] for _ in range(len(query_ids))]
             for index_file in index_files:
-                # --- ONLY ONE INDEX IN RAM AT A TIME ---
-                tmp_index = faiss.read_index(SparkFiles.get(index_file))
+                # tmp_index = faiss.read_index(SparkFiles.get(index_file))
+                tmp_index = cache.get(index_file)
+                tmp_index.nprode = real_n
                 k = min(real_n, tmp_index.ntotal)
                 dists, nids = tmp_index.search(batch, k)   # (Q, k)
-                del tmp_index   # release before next iteration
+                del tmp_index
                 gc.collect()
 
                 for q_idx in range(len(query_ids)):
                     for rank in range(k):
                         nid = int(nids[q_idx, rank])
-                        if nid >= 0:  # FAISS returns -1 for padding
+                        if nid >= 0:
                             candidates[q_idx].append((float(dists[q_idx, rank]), nid))
 
-            # Emit top-n per query, sorted by distance (ascending)
             for q_idx, qid in enumerate(query_ids):
                 top = sorted(candidates[q_idx], key=lambda x: x[0])[:real_n]
                 for dist, nid in top:
