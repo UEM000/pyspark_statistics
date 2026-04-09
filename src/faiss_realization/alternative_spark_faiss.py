@@ -1,3 +1,4 @@
+from __future__ import annotations
 import numpy as np
 import pyspark.sql as spark
 import pyspark.sql.functions as F
@@ -7,6 +8,7 @@ import sys
 
 from pyspark.ml.feature import VectorAssembler
 from pyspark import StorageLevel, Broadcast, RDD
+from pyspark.sql import SparkSession
 from pyspark.sql.types import (
     StructType, 
     StructField, 
@@ -21,8 +23,10 @@ from typing import (
     Optional,
     Iterable,
     Tuple,
+    Any
 )
 from tqdm import tqdm
+from index_cacher import SessionError
             
     
 
@@ -87,6 +91,7 @@ class FaissSpark:
 
     def __init__(
             self,
+            # session: SparkSession,
             n_neighbors: int = 1,
             k: int = 1000,
             seed: Union[int, None] = None,
@@ -122,6 +127,56 @@ class FaissSpark:
         self._clustered_data: Optional[spark.DataFrame] = None
         self._mode: Optional[Literal["base", "partition"]] = None
         self._sharded_rdd: Optional[RDD] = None
+
+    @staticmethod
+    def _session_analizer(session: SparkSession) -> dict[str, Any]:
+        """
+        Анализатор спарк сессии.
+        """        
+        def _bytes_calculator(field: str) -> float:
+            """
+            Return
+            ------
+                `float` Размер в мб 
+            """
+            field = field.strip().lower()
+            if field.endswith('m'):
+                return float(field[:-1])
+            if field.endswith('g'):
+                return float(field[:-1]) * 1024
+        
+        defalt_config = {
+            # "spark.python.worker.reuse" : True,
+            # "spark.executor.memoryOverhead" : '',
+            "spark.executor.memory" : "1g",
+            "spark.executor.cores" : 1
+        }
+    
+        sc = session.sparkContext
+        executor_python_param = sc.getConf().get("spark.python.worker.reuse")
+        overhead_memory = sc.getConf().get("spark.executor.memoryOverhead")
+        executor_memory = sc.getConf().get("spark.executor.memory") or defalt_config["spark.executor.memory"]
+        executor_cores = sc.getConf().get("spark.executor.cores") or defalt_config["spark.executor.cores"]
+
+
+        executor_memory = _bytes_calculator(executor_memory)
+        executor_cores = int(executor_cores)
+        if executor_python_param is None or executor_python_param == "true":
+            executor_python_param = True
+        else: 
+            executor_python_param = False
+            raise SessionError("spark.python.worker.reuse")
+        
+        if overhead_memory is None:
+            overhead_memory = 0.1 * executor_memory
+        else:
+            overhead_memory = _bytes_calculator(overhead_memory)
+        
+        return {
+            "overhead_memory" : overhead_memory, 
+            "executor_cores" : executor_cores
+        }
+
 
     def _vectorize_data(
             self, 
@@ -344,6 +399,7 @@ class FaissSpark:
         import gc
 
         session = test_data.sparkSession
+        config_dict = self._session_analizer(session)
         tmp_dir = "__partition_indexes"
         # if os.
         os.makedirs(tmp_dir, exist_ok=True) 
@@ -366,13 +422,15 @@ class FaissSpark:
         bc_index_files_list = session.sparkContext.broadcast(index_files_list)
         bc_n_neighbors = session.sparkContext.broadcast(self.n_neighbors)
         bc_chunk_size = session.sparkContext.broadcast(self.CHUMK_SIZE)
+        bc_config_dict = session.sparkContext.broadcast(config_dict)
 
         result_rdd = test_data.rdd.mapPartitions(lambda it:
                                         FaissSpark._per_partition_predict(
                                         it, 
                                         bc_n_neighbors=bc_n_neighbors, 
                                         bc_index_files_list=bc_index_files_list,
-                                        bc_chunk_size=bc_chunk_size
+                                        bc_chunk_size=bc_chunk_size,
+                                        bc_config_dict=bc_config_dict
             )
         )
 
@@ -395,7 +453,8 @@ class FaissSpark:
         shard_iter: Iterable,
         bc_n_neighbors: Broadcast,
         bc_index_files_list: Broadcast,
-        bc_chunk_size: Broadcast
+        bc_chunk_size: Broadcast,
+        bc_config_dict: Broadcast
     ):
         """
         Predict локально на каждой партиции.
@@ -413,6 +472,9 @@ class FaissSpark:
 
             bc_index_files_list: `Broadcast`
                 Список из номеров файлов, где хранятся построенные индексы каждой партиции.  
+
+            bc_config_dict: `Broadcast`
+                Словарь с конфигом сессии.
         """
         import faiss
         import numpy as np
@@ -422,7 +484,7 @@ class FaissSpark:
         from index_cacher import get_executor_cache
 
         # One shared cache across ALL partition tasks on this executor worker
-        cache = get_executor_cache(max_index=2)
+        cache = get_executor_cache(bc_config_dict.value)
             
         real_n = bc_n_neighbors.value
         index_files = bc_index_files_list.value

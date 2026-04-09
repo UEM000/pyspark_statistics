@@ -1,8 +1,16 @@
+from __future__ import annotations
 from collections import OrderedDict
 from pyspark import SparkFiles
 import faiss
 import builtins
 import threading
+
+class SessionError(Exception):
+
+    def __init__(self, config_field: str):
+        super().__init__(
+            f"Your session configuration is insufficient. Please chacnge {config_field} according to documentation."
+        )
 
 class CachingIndex:
     """
@@ -14,17 +22,61 @@ class CachingIndex:
 
     def __init__(
         self,
-        max_index: int=2
+        k: float=0.5,
+        executor_cores: int=None, 
+        overhead_memory: int=None,
+        index_bytes: int=128,
+        max_index: int=None
     ):
         """
         Args
         ----
+            k : `float`
+                доля от overhead memory, которую мы позволяем использовать для подгрузки индексов.
+
+            executor_cores : `int`
+                количество ядер на экзеъюторе.
+            
+            overhead_memory : `int`
+                оверхед экзекъютора, память вне кучи JVM.
+            
+            index_bytes : `int`
+                Размер индекса одной партиции в мегабайтах, по-умолчанию = 128 мб.
+
             max_index : `int`
-                Колчиество индексов в памяти одновременно.
+                Колчиество индексов в памяти одновременно, если None, то вычисляется автоматически. 
         """
-        self._max = max_index
+        self._index_bytes = index_bytes
+        if max_index is None:
+            if executor_cores is None and overhead_memory is None:
+                raise ValueError("executor_cores and overhead_memory cannot both be None")
+            self._max = self._max_index_calc(
+                k=k, 
+                executor_cores=executor_cores, 
+                overhead_memory=overhead_memory, 
+                index_bytes=index_bytes
+            )
+        else:
+            self._max = max_index
         self._cache = OrderedDict()
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _max_index_calc(
+        k: float,
+        executor_cores: int | None, 
+        overhead_memory: int | None,
+        index_bytes: int,
+    ) -> int:
+        """
+        Автоматический подбор количества индексов в кэшэ.
+        """
+        if overhead_memory is None:
+            return executor_cores
+        avalible_space = int(overhead_memory * k / index_bytes)
+        if executor_cores is None:
+            return max(1, avalible_space)
+        return max(1, min(avalible_space, executor_cores))
     
     def get(
             self,
@@ -58,8 +110,8 @@ class CachingIndex:
             tmp_index = faiss.read_index(SparkFiles.get(index_file))
             self._cache[index_file] = tmp_index
             return tmp_index
-    
-def get_executor_cache(max_index: int = 2) -> CachingIndex:
+        
+def get_executor_cache(config_dict) -> CachingIndex:
     if not hasattr(builtins, '_faiss_index_cache'):
-        builtins._faiss_index_cache = CachingIndex(max_index=max_index)
+        builtins._faiss_index_cache = CachingIndex(**config_dict)
     return builtins._faiss_index_cache
