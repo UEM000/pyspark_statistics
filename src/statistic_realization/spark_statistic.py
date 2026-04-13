@@ -134,14 +134,14 @@ class TestingTTest(StatTest):
                 for control, test in groups_pairs_list:
                     if self.realization:
                         if self.realization == 1 or self.realization == 2:
-                            current_variance = (statistic_frame[f"{column}_{split}_{control}_var"],
-                                                statistic_frame[f"{column}_{split}_{test}_var"])
-                            
-                            current_mean = (statistic_frame[f"{column}_{split}_{control}_mean"],
-                                                statistic_frame[f"{column}_{split}_{test}_mean"])
-                            
-                            currecnt_size = (statistic_frame[f"{column}_{split}_{control}_count"],
-                                                statistic_frame[f"{column}_{split}_{test}_count"])
+                            current_variance = (float(statistic_frame[f"{column}_{split}_{control}_var"]),
+                                                float(statistic_frame[f"{column}_{split}_{test}_var"]))
+
+                            current_mean = (float(statistic_frame[f"{column}_{split}_{control}_mean"]),
+                                                float(statistic_frame[f"{column}_{split}_{test}_mean"]))
+
+                            currecnt_size = (float(statistic_frame[f"{column}_{split}_{control}_count"]),
+                                                float(statistic_frame[f"{column}_{split}_{test}_count"]))
                         elif self.realization == 3:
                             currecnt_size, current_mean, current_variance = self._extract_stats(statistic_frame,
                                                                                                 column,
@@ -246,10 +246,10 @@ class TestingTTest(StatTest):
         return tmp_table
     
     @staticmethod
-    def _extract_stats(pivot_table: DataFrame, 
-                       target_column:str, 
-                       control: int, 
-                       test: int, 
+    def _extract_stats(pivot_table: DataFrame,
+                       target_column:str,
+                       control: int,
+                       test: int,
                        split: int):
         t_count, t_mean, t_var = (
                                     pivot_table
@@ -261,7 +261,7 @@ class TestingTTest(StatTest):
                                             ])
                                     .collect()[0]
                                 )
-        
+
         c_count, c_mean, c_var = (
                                     pivot_table
                                     .filter(((F.col("split") == split) & (F.col("grouped") == ord(str(control)))))
@@ -272,7 +272,7 @@ class TestingTTest(StatTest):
                                             ])
                                     .collect()[0]
                                 )
-        return (c_count, t_count), (c_mean, t_mean), (c_var, t_var)
+        return (float(c_count), float(t_count)), (float(c_mean), float(t_mean)), (float(c_var), float(t_var))
     
     @staticmethod
     def _t_statistics(n_list: tuple, 
@@ -606,9 +606,9 @@ class TestingKStest(StatTest):
             for split in range(self.k_splits):
                 for control, test in groups_pairs_list:
                     if self.realization and self.realization < 3:
-                        n_control = statistics[f"n{control}_{column}_{split}"]
-                        n_test = statistics[f"n{test}_{column}_{split}"]
-                        d = statistics[f"D_{test}_{column}_{split}"]
+                        n_control = float(statistics[f"n{control}_{column}_{split}"])
+                        n_test = float(statistics[f"n{test}_{column}_{split}"])
+                        d = float(statistics[f"D_{test}_{column}_{split}"])
                         tmp_dict[f"split: {split} groups: {control}, {test}"] = self._asymptotic_ks_pvalue(d, n_control, n_test, self.reliability)
                     elif self.realization == 3:
                         test_column, control_column = self._target_column_extracting(column, control, test)
