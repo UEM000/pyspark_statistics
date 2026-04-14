@@ -26,7 +26,7 @@ class CachingIndex:
         executor_cores: int=None, 
         overhead_memory: int=None,
         index_bytes: int=128,
-        max_index: int=None
+        max_index: int=2
     ):
         """
         Args
@@ -99,7 +99,7 @@ class CachingIndex:
         """
         with self._lock:
             if index_file in self._cache:
-                self._cache.move_to_end(index_file=index_file)
+                self._cache.move_to_end(key=index_file)
                 return self._cache[index_file]
 
             if len(self._cache) == self._max:

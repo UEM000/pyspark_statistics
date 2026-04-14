@@ -4,6 +4,7 @@ import pyspark.sql as spark
 import pyspark.sql.functions as F
 import faiss
 import os
+import gc
 import sys
 
 from pyspark.ml.feature import VectorAssembler
@@ -15,7 +16,7 @@ from pyspark.sql.types import (
     LongType,
     FloatType
 )
-from collections import defaultdict
+from sklearn.cluster import MiniBatchKMeans, Birch
 from typing import (
     Union,
     List,
@@ -88,6 +89,10 @@ class FaissSpark:
         StructField("distance",    FloatType(), False),
     ])
     CHUMK_SIZE = 512
+    CLUSTERING_METHODS_MAPPER = {
+        "k-means" : MiniBatchKMeans,
+        "birch" : Birch
+    }
 
     def __init__(
             self,
@@ -97,6 +102,8 @@ class FaissSpark:
             seed: Union[int, None] = None,
             feature_cols: Union[List[str], None] = None,
             faiss_mode: Literal["base", "partition", "auto"] = "auto",
+            faiss_prefit_mode: Literal["sample", "full"] = "full",
+            faiss_prefit_dict: dict[str, Any] = None
     ):
         """
         Args
@@ -116,12 +123,25 @@ class FaissSpark:
             faiss_mode: `Literal["base", "partition", "auto"]`
                 выбор алгоритма поиска соедей, по-умолчанию "auto".
                 В "auto" моде выбирается режим в зависимости от размера выборки.
+
+            faiss_prefit_mode: `Literal["sample", "full"]`
+                выбор алгоритма формирования кластеров для faiss. 
+                `sample` - обучается на сэмпле данных и использует внутренний k-means в faiss;
+                `full` - батчами выгружает данные на драйвер, где обучает кластеризатор,
+                центроиды кластеров которого далее используются в faiss.
+            
+            faiss_prefit_dict: `dict[str, Any]`
+                словарь параметров для модели, долен содержать два поля: 
+                `model` - название модели (`k-means`, `birch`),
+                `params` - `dict` с параметрами модели.
         """
         self.n_neighbors = n_neighbors
         self.k = k
         self.seed = seed or 21
         self.feature_cols = feature_cols
         self.faiss_mode = faiss_mode
+        self.faiss_prefit_mode = faiss_prefit_mode
+        self.faiss_prefit_dict = faiss_prefit_dict
 
         self._index = None
         self._clustered_data: Optional[spark.DataFrame] = None
@@ -236,7 +256,7 @@ class FaissSpark:
 
     def _partition_fit(
             self, 
-            data: spark.DataFrame
+            data: spark.DataFrame,
     ) -> None:
         """
         Реализация partition faiss fit. 
@@ -248,8 +268,10 @@ class FaissSpark:
         Args
         ----
             data: `spark.DataFrame`
-                Данные для которых мы ищем соседей.
-        
+                Данные в которых мы ищем соседей.
+
+            mode: `Literal["sample", "full"]`
+                алгоритм обучение IVF-индекса. По-умолчанию `full`.
         Return
         ------
             None
@@ -260,27 +282,38 @@ class FaissSpark:
         self._clustered_data = prepeared_data
         session = data.sparkSession
 
-        data_size = prepeared_data.count()
-        frac = min(self._SAMPLE_TARGET / max(data_size, 1), 1.0)
+        if self.faiss_prefit_mode == "sample":
+            data_size = prepeared_data.count()
+            frac = min(self._SAMPLE_TARGET / max(data_size, 1), 1.0)
 
-        sample_rows = (
-                        prepeared_data
-                        .sample(fraction=frac, seed=self.seed)
-                        .select("features")
-                        .collect()
-                    )
-        X = np.array(
-            [list(row['features']) for row in sample_rows],
-            dtype=np.float32,
-        )
+            sample_rows = (
+                            prepeared_data
+                            .sample(fraction=frac, seed=self.seed)
+                            .select("features")
+                            .collect()
+                        )
+            X = np.array(
+                [list(row['features']) for row in sample_rows],
+                dtype=np.float32,
+            )
 
-        d = X.shape[1]
-        # IVF Faiss подерживает до 39 * (training points) на один кластер
-        nlist = min(self.k, max(1, X.shape[0] // 39)) 
+            d = X.shape[1]
+            # IVF Faiss подерживает до 39 * (training points) на один кластер
+            nlist = min(self.k, max(1, X.shape[0] // 39)) 
 
-        quantizer = faiss.IndexFlatL2(d)
-        self._index = faiss.IndexIVFFlat(quantizer, d, nlist)
-        self._index.train(X)
+            quantizer = faiss.IndexFlatL2(d)
+            self._index = faiss.IndexIVFFlat(quantizer, d, nlist)
+            self._index.train(X)
+            print("=" * 70)
+            print("Sample fit done.")
+            print("=" * 70)
+        elif self.faiss_prefit_mode == 'full':
+            self._prefit(data=prepeared_data)
+            print("=" * 70)
+            print("Clusters prefit done.")
+            print("=" * 70)
+        else:
+            raise ValueError(f"Incorrect prefit mode: {type(self.faiss_prefit_mode).__name__}")
 
         bc_index = session.sparkContext.broadcast(self._index)
         del self._index
@@ -338,6 +371,80 @@ class FaissSpark:
         # yield index_with_ids
         yield faiss.serialize_index(index_with_ids)
 
+    def _prefit(
+            self, 
+            data: spark.DataFrame
+        ) -> None:
+        """
+        Обучение IVF-индекса на всем data датасете путем итеративной выгрузки партиций на драйвер.
+        
+        Args
+        ----
+            data : `spark.DataFrame`
+                Данные в которых мы ищем соседей.
+
+        """
+        if self.faiss_prefit_dict is None:
+            raise ValueError("`faiss_prefit_dict` must be provided when faiss_prefit_mode='full'")
+        
+        model_name = self.faiss_prefit_dict["model"]
+        model_params = self.faiss_prefit_dict["params"]
+
+        if model_name == 'k-means' and "n_clusters" in model_params:
+            if model_params["n_clusters"] == self.k:
+                pass
+            else:
+                raise ValueError(f"K-means n_clusters and k should be equal. But k={self.k} and n_clusters={model_params['n_clusters']}")
+        else:
+            model_params["n_clusters"] = self.k
+
+        model_cls = self.CLUSTERING_METHODS_MAPPER[model_name]
+        model = model_cls(**model_params) #TODO: для k-means число кластеров должно быть = self.k
+        
+        batch_size = self.DRIVER_INDEX_LIMIT
+        np_batch = None
+
+        for batch in (
+            data
+            .select("features") #TODO: тут или ранее сделать обработку None
+            .rdd
+            .mapPartitions(lambda it: FaissSpark._partition_load(it, batch_size))
+            .toLocalIterator()
+        ):
+            np_batch = np.array(batch, dtype=np.float32)
+            model.partial_fit(np_batch)
+            # self._index.train(np_batch)
+
+        
+        if np_batch is not None:
+            del np_batch
+            gc.collect()
+
+        centroids = model.cluster_centers_ if model_name == 'k-means' else model.subcluster_centers_
+        centroids = centroids.astype(np.float32)
+        index_shape = centroids.shape[1] #TODO: тут или ранее сделать обработку None 
+        # nlist = min(len(centroids), max(1, data.count() // 39)) 
+        nlist = len(centroids)
+
+        quantizer = faiss.IndexFlatL2(index_shape)
+        quantizer.add(centroids)
+        self._index = faiss.IndexIVFFlat(quantizer, index_shape, nlist)
+        self._index.is_trained = True
+        # self._index.train(centroids.astype(np.float32))
+
+        self._clustering_model = model
+        
+    @staticmethod
+    def _partition_load(partition_iter, batch_size):
+        batch = []
+        for row in partition_iter:
+            batch.append(list(row["features"]))
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
     def _direct_predict(
             self, 
             test_data: spark.DataFrame
@@ -384,7 +491,7 @@ class FaissSpark:
         4. Результаты обернуты в `Spark.Dataframe` с схемой 
         (_id `LongType`, neighbor_id `LongType`, distance `FloatType`).
 
-        5. Удаление временных файлов и временной директории после материализации
+        5. Удаление временных файлов и временной дирекятории после материализации
         результатов в датафрейм.
 
         Args
@@ -522,7 +629,7 @@ class FaissSpark:
             for index_file in index_files:
                 # tmp_index = faiss.read_index(SparkFiles.get(index_file))
                 tmp_index = cache.get(index_file)
-                tmp_index.nprode = real_n
+                tmp_index.nprobe = real_n
                 k = min(real_n, tmp_index.ntotal)
                 dists, nids = tmp_index.search(batch, k)   # (Q, k)
                 del tmp_index
