@@ -531,6 +531,7 @@ class FaissSpark:
         bc_index_files_list = session.sparkContext.broadcast(index_files_list)
         bc_n_neighbors = session.sparkContext.broadcast(self.n_neighbors)
         bc_chunk_size = session.sparkContext.broadcast(self.CHUMK_SIZE)
+        bc_k = session.sparkContext.broadcast(self.n_neighbors)
         # bc_config_dict = session.sparkContext.broadcast(config_dict)
 
         result_rdd = test_data.rdd.mapPartitions(lambda it:
@@ -539,6 +540,7 @@ class FaissSpark:
                                         bc_n_neighbors=bc_n_neighbors, 
                                         bc_index_files_list=bc_index_files_list,
                                         bc_chunk_size=bc_chunk_size,
+                                        bc_k=bc_k
                                         # bc_config_dict=bc_config_dict
             )
         )
@@ -563,6 +565,7 @@ class FaissSpark:
         bc_n_neighbors: Broadcast,
         bc_index_files_list: Broadcast,
         bc_chunk_size: Broadcast,
+        bc_k: Broadcast
         # bc_config_dict: Broadcast
     ):
         """
@@ -630,7 +633,7 @@ class FaissSpark:
             candidates = [[] for _ in range(len(query_ids))]
             for index_file in index_files:
                 # tmp_index = faiss.read_index(SparkFiles.get(index_file))
-                tmp_index = cache.get(index_file)
+                tmp_index = cache.get(index_file, nprobe=min(real_n, bc_k.value))
                 tmp_index.nprobe = real_n
                 k = min(real_n, tmp_index.ntotal)
                 dists, nids = tmp_index.search(batch, k)   # (Q, k)

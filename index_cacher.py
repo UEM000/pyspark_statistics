@@ -65,7 +65,8 @@ class CachingIndex:
     
     def get(
             self,
-            index_file: int
+            index_file: int,
+            nprode: int
     ):
         """
         Получаем индексы по заданному названию файла. Если такой файл уже обрабатывался,
@@ -93,6 +94,8 @@ class CachingIndex:
                 import gc; gc.collect()
             
             tmp_index = faiss.read_index(SparkFiles.get(index_file))
+            inner = faiss.downcast_index(tmp_index.index)
+            inner.nprode = nprode
             self._cache[index_file] = tmp_index
             return tmp_index
         
